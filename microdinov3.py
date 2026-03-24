@@ -1,8 +1,8 @@
 """
-The most atomic way to train and run inference for DINOv3 in pure, dependency-free Python.
+The almost-most atomic way to train and run inference for DINOv3 in pure, dependency-free Python.
 Inspired by Karpathy's microGPT.py
 This file is the complete algorithm.
-Everything else is just efficiency.
+Everything else is just efficiency (well I did apply some efficiency to convert Value to Matrix so it can actually run).
 """
 
 import os
@@ -24,30 +24,103 @@ raw = gzip.decompress(data)
 
 # parse the raw MNIST data into a list of images that are normalized
 _, n, rows, cols = struct.unpack('>IIII', raw[:16])
-images = [[b / 255.0 for b in raw[16 + i*rows*cols : 16 + (i+1)*rows*cols]] for i in range(n)]
+images = [[[b / 255.0 for b in raw[16 + i * rows * cols + r * cols : 16 + i * rows * cols + (r + 1) * cols]] for r in range(rows)] for i in range(n)]
 print(f"num images: {len(images)}, size: {rows}x{cols}")
 
-class Value:
-    __slots__ = ('data', 'grad', '_children', '_local_grads') # Python optimization for memory usage
+class Matrix:
+    __slots__ = ('data', 'grad', '_children', '_backward', 'requires_grad')
 
-    def __init__(self, data, children=(), local_grads=()):
-        self.data = data                # scalar value of this node calculated during forward pass
-        self.grad = 0                   # derivative of the loss w.r.t. this node, calculated in backward pass
-        self._children = children       # children of this node in the computation graph
-        self._local_grads = local_grads # local derivative of this node w.r.t. its children
+    def __init__(self, data, children=(), _backward=None, requires_grad = True):
+        self.data = data                                                   # list of scalar values of this node calculated during forward pass MxN shape
+        self.grad = self.vals_like(self, 0) if requires_grad else None     # list of derivatives of the loss w.r.t. this node, calculated in backward pass
+        self._children = children                                          # children of this node in the computation graph
+        self._backward = _backward                                         # backward function for gradient computation
+        self.requires_grad = requires_grad
 
     def __add__(self, other):
-        other = other if isinstance(other, Value) else Value(other)
-        return Value(self.data + other.data, (self, other), (1, 1))
-
+        if isinstance(other, Matrix):
+            assert self.shape() == other.shape() # elementwise addition for same shape matrices
+            out = Matrix(
+                [[a + b for a, b in zip(row_a, row_b)] for row_a, row_b in zip(self.data, other.data)],
+                (self, other),
+            )
+            out._backward = lambda: Matrix._elementwise_backward(out, (self, other), lambda g, a, b: (g, g)) 
+            return out
+        else:
+            out = Matrix(
+                [[a + other for a in row] for row in self.data],
+                (self,),
+            )
+            out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g,)) 
+            return out
+    
     def __mul__(self, other):
-        other = other if isinstance(other, Value) else Value(other)
-        return Value(self.data * other.data, (self, other), (other.data, self.data))
+        if isinstance(other, Matrix):
+            assert self.shape()[1] == other.shape()[0] # NxP for self, PxM for other
+            def _backward():
+                # dL/dself = dL/dout * dout/dself = out.grad @ other.T
+                # dL/dother = dL/dout * dout/dother = self.T @ out.grad
+                if self.grad is not None:
+                    self.grad = [[sg + sum(g * b for g, b in zip(out_row, col_b))                                                                                    
+                                    for sg, col_b in zip(sg_row, zip(*other.data))]                                                                                  
+                                        for sg_row, out_row in zip(self.grad, out.grad)]
+                if other.grad is not None: 
+                    other.grad = [[og + sum(a * g for a, g in zip(col_a, col_g))                                                                                     
+                                for og, col_g in zip(og_row, zip(*out.grad))]                                                                                     
+                                        for og_row, col_a in zip(other.grad, zip(*self.data))]      
+            out = Matrix(
+                # multiply rowA by colB for each rowA in self and colB in other and sum to get each element of the output
+                [[sum(a * b for a, b in zip(row_a, col_b)) for col_b in zip(*other.data)] for row_a in self.data],
+                (self, other),
+            )
+            out._backward = _backward
+            return out
+        else:
+            out = Matrix(
+                [[a * other for a in row] for row in self.data],
+                (self,),
+            )
+            out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g * other,))
+            # scalar multiplication just scales the gradient by other
+            return out  
 
-    def __pow__(self, other): return Value(self.data**other, (self,), (other * self.data**(other-1),))
-    def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
-    def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
-    def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
+    def __pow__(self, other): 
+        out = Matrix([[a ** other for a in row] for row in self.data],(self,),)
+        out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g * other * a ** (other - 1),)) 
+        # power rule: d(a^b)/da = b * a^(b-1) -- gradient scaled by other and a^(other-1)
+        return out
+    
+    def log(self):
+        out = Matrix([[math.log(a) for a in row] for row in self.data],(self,),)
+        out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g / a,)) 
+        # derivative of log(a) is 1/a -- gradient scaled by 1/a
+        return out
+
+    def exp(self):
+        out = Matrix([[math.exp(a) for a in row] for row in self.data],(self,),)
+        out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g * math.exp(a),)) 
+        # derivative of exp(a) is exp(a) -- gradient scaled by exp(a)
+        return out
+
+    def silu(self):
+        # x times sigmoid(x) or x / (1 + exp(-x))
+        out = Matrix([[a / (1 + math.exp(-a)) for a in row] for row in self.data],(self,),)
+        out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g * (1 / (1 + math.exp(-a)) + a * math.exp(-a) / ((1 + math.exp(-a)) ** 2)),)) 
+        # derivative of silu(a) is sigmoid(a) + a * sigmoid'(a) -- gradient scaled by that
+        # sigmoid'(a) = sigmoid(a) * (1 - sigmoid(a))
+        # yes I fused SiLU, but you could do it separately if needed (autograd handles)
+        return out
+    
+    def tanh(self):
+        out = Matrix([[math.tanh(a) for a in row] for row in self.data],(self,),)
+        out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g * (1 - math.tanh(a) ** 2),)) 
+        # derivative of tanh(a) is 1 - tanh(a)^2 -- gradient scaled by that
+        # some more fusing because faster for GELU
+        return out
+
+    def GELU(self):
+        return 0.5 * self * (1 + (math.sqrt(2 / math.pi) * (self + 0.044715 * self**3)).tanh()) # this is the exact GELU formula, but the derivative is a mess so not fusing it
+
     def __neg__(self): return self * -1
     def __radd__(self, other): return self + other
     def __sub__(self, other): return self + (-other)
@@ -55,28 +128,46 @@ class Value:
     def __rmul__(self, other): return self * other
     def __truediv__(self, other): return self * other**-1
     def __rtruediv__(self, other): return other * self**-1
-
+    
+    def vals_like(self, matrix, val):
+        return [([val] * len(matrix.data[0])) for _ in range(len(matrix.data))]
+    
+    def shape(self):
+        return (len(self.data), len(self.data[0]) if self.data else 0)
+    
+    @staticmethod
+    def _elementwise_backward(out, children, grad_fn):
+      for i in range(len(out.data)):
+          for j in range(len(out.data[0])):
+              g = out.grad[i][j]
+              vals = tuple(c.data[i][j] for c in children)
+              grads = grad_fn(g, *vals)
+              for child, cg in zip(children, grads):
+                  if child.grad is not None:
+                    child.grad[i][j] += cg
     def backward(self):
+        # non-recursive to prevent any potential issues
         topo = []
         visited = set()
-        def build_topo(v):
-            if v not in visited:
-                visited.add(v)
-                for child in v._children:
-                    build_topo(child)
-                topo.append(v)
-        build_topo(self)
-        self.grad = 1
-        for v in reversed(topo):
-            for child, local_grad in zip(v._children, v._local_grads):
-                child.grad += local_grad * v.grad
+        stack = [(self, False)]
+        while stack:
+            v, done = stack.pop()
+            if done: topo.append(v)
+            elif id(v) not in visited and v.requires_grad:
+                visited.add(id(v))
+                stack.append((v, True))
+                for c in v._children: stack.append((c, False))
+        self.grad = self.vals_like(self, 1)
+        for i in reversed(topo):
+            i._backward()
+
 
 
 # Augmentations are vital for DINOv3
-GLOBAL_CROP_SIZE              = 20  # DINOv3 uses 224 global out of 256, but we're using MNIST
-LOCAL_CROP_SIZE               = 10  # DINOv3 uses 96 local out of 256
-GLOBAL_CROPS                  = 2
-LOCAL_CROPS                   = 4   # Often 8 local crops
+GLOBAL_CROP_SIZE              = 24  # DINOv3 uses 224 global out of 256, but we're using MNIST
+LOCAL_CROP_SIZE               = 16  # DINOv3 uses 96 local out of 256
+GLOBAL_CROPS                  = 1   # used 2 global crops
+LOCAL_CROPS                   = 2   # used 8 local crops
 
 GLOBAL_BLUR_PROB              = 0.1
 LOCAL_BLUR_PROB               = 0.5
@@ -143,12 +234,20 @@ def get_crops(image):
     local_crops = [crop(augment_image(image), LOCAL_CROP_SIZE) for _ in range(LOCAL_CROPS)]
     return global_crops, local_crops
 
+
+PATCH_SIZE = 4
+N_EMBED = 16
+N_LAYER = 1
+N_HEAD = 4
+HEAD_DIM = N_EMBED // N_HEAD
+
+
 """
 # TODO:
     - IMAGE PROCESSING:
         - DINOv3 MNIST loaded [x]
-        - Augmentations (random crops, blur) [ ]
-        - Local/Global Crops [ ]
+        - Augmentations (random crops, blur) [X]
+        - Local/Global Crops [X]
     - Autograd implemented [x]
     - MODEL:
         - 4x4 Patch embedding [ ]
