@@ -2,7 +2,7 @@
 The almost-most atomic way to train and run inference for DINOv3 in pure, dependency-free Python.
 Inspired by Karpathy's microGPT.py
 This file is the complete algorithm.
-Everything else is just efficiency (well I did apply some efficiency to convert Value to Matrix so it can actually run).
+Everything else is just efficiency (well I did apply some efficiency to convert Value to Tensor so it can actually run).
 """
 
 import os
@@ -27,223 +27,149 @@ _, n, rows, cols = struct.unpack('>IIII', raw[:16])
 images = [[[b / 255.0 for b in raw[16 + i * rows * cols + r * cols : 16 + i * rows * cols + (r + 1) * cols]] for r in range(rows)] for i in range(n)]
 print(f"num images: {len(images)}, size: {rows}x{cols}")
 
-class Data:
+#basic arithmetic operators that work across data and matrices
+class Arithmetic:                                                                                                
+      def __neg__(self): return self * -1                                                                             
+      def __radd__(self, other): return self + other                                                                    
+      def __sub__(self, other): return self + (-other)                                                                
+      def __rsub__(self, other): return other + (-self)
+      def __rmul__(self, other): return self * other
+      def __truediv__(self, other): return self * other**-1
+      def __rtruediv__(self, other): return other * self**-1  
+
+# holding raw data that can be manipulated
+class Raw(Arithmetic):
     __slots__ = ('data',)
     def __init__(self, data): self.data = data
     @classmethod
     def vals_like(cls, rows, cols, val=0): return cls([[val] * cols for _ in range(rows)])   
+    @classmethod 
+    def random_init(cls, rows, cols, std=.08): return cls([[random.gauss(0, std) for _ in range(cols)] for _ in range(rows)])
     def shape(self): return (len(self.data), len(self.data[0]) if self.data else 0)
-
     def __add__(self, other): 
-        if isinstance(other, Data): return Data([[a + b for a, b in zip(row_a, row_b)] for row_a, row_b in zip(self.data, other.data)])
-        else: return Data([[a + other for a in row] for row in self.data])
-    def __neg__(self): return Data([[-a for a in row] for row in self.data])              
+        if isinstance(other, Raw): return Raw([[a + b for a, b in zip(row_a, row_b)] for row_a, row_b in zip(self.data, other.data)])
+        else: return Raw([[a + other for a in row] for row in self.data])            
     def __matmul__(self, other): 
         oT = list(zip(*other.data))                                                                                       
-        return Data([[sum(a*b for a,b in zip(row, col)) for col in oT] for row in self.data])
-    def __pow__(self, val): return Data([[a**val for a in row] for row in self.data])
-    def __radd__(self, other): return self + other
-    def __sub__(self, other): return self + (-other)
-    def __rsub__(self, other): return other + (-self)
-    def __rmul__(self, other): return self * other
-    def __truediv__(self, other): return self * other**-1
-    def __rtruediv__(self, other): return other * self**-1
-    def __iadd__(self, other):
-        if isinstance(other, Data):
+        return Raw([[sum(a*b for a,b in zip(row, col)) for col in oT] for row in self.data])
+    def __pow__(self, val): return Raw([[a**val for a in row] for row in self.data])
+    def __iadd__(self, other): # element in-place addition
+        if isinstance(other, Raw):
           for i in range(len(self.data)):
               for j in range(len(self.data[0])):
                   self.data[i][j] += other.data[i][j]
         return self
     def __mul__(self, other):
-        if isinstance(other, Data): return Data([[a * b for a, b in zip(ra, rb)] for ra, rb in zip(self.data, other.data)]) # hadamard multiplication
-        else: return Data([[a * other for a in row] for row in self.data])
+        if isinstance(other, Raw): return Raw([[a * b for a, b in zip(ra, rb)] for ra, rb in zip(self.data, other.data)]) # hadamard multiplication
+        else: return Raw([[a * other for a in row] for row in self.data])
     def __getitem__(self, idx):
       if not isinstance(idx, tuple): idx = (idx, slice(None))
       rows = self.data[idx[0]] if isinstance(idx[0], slice) else [self.data[idx[0]]]
-      if isinstance(idx[1], slice): return Data([row[idx[1]] for row in rows])
-      else: return Data([[row[idx[1]]] for row in rows])
-
+      if isinstance(idx[1], slice): return Raw([row[idx[1]] for row in rows])
+      else: return Raw([[row[idx[1]]] for row in rows])
     def acc_at(self, rows, cols, other):  # scatter accumulate for slice backward
       for i, r in enumerate(rows):
           for j, c in enumerate(cols):
               self.data[r][c] += other.data[i][j]
     def T(self):
-        return Data([list(col) for col in zip(*self.data)])
+        return Raw([list(col) for col in zip(*self.data)])
     @staticmethod
     def concat(*datas, axis=0):
         if axis == 0:                                                                                                     
             out = []                                                                                                      
             for d in datas: out.extend(d.data)       
-            return Data(out)                                                                                              
+            return Raw(out)                                                                                              
         else:
-            return Data([sum([d.data[i] for d in datas], []) for i in range(len(datas[0].data))])      
+            return Raw([sum([d.data[i] for d in datas], []) for i in range(len(datas[0].data))])      
         
 
-
-class Matrix:
+# Tensor with gradients
+class Tensor(Arithmetic):
     __slots__ = ('data', 'grad', '_children', '_backward', 'requires_grad')
 
     def __init__(self, data, children=(), _backward=None, requires_grad=True):
-        self.data = data                                                   # list of scalar values of this node calculated during forward pass MxN shape
-        self.grad = Matrix.vals_like(self, 0) if requires_grad else None     # list of derivatives of the loss w.r.t. this node, calculated in backward pass
-        self._children = children                                          # children of this node in the computation graph
-        self._backward = _backward                                         # backward function for gradient computation
+        self.data = data if isinstance(data, Raw) else Raw(data)
+        self.grad = Raw.vals_like(*self.data.shape()) if requires_grad else None
+        self._children = children
+        self._backward = _backward
         self.requires_grad = requires_grad
-
 
     @classmethod
     def random_init(cls, rows, cols, std=.08, requires_grad=True):
-        return cls([[random.gauss(0, std) for _ in range(cols)] for _ in range(rows)], requires_grad=requires_grad)
+        return cls(Raw.random_init(rows, cols, std), requires_grad=requires_grad)
+
+    def shape(self): return self.data.shape()
+    def _ones(self): return Raw.vals_like(*self.data.shape(), val=1)
+    def _apply(self, fn): return Raw([[fn(a) for a in row] for row in self.data.data])
+
+    # unary op: out = f(self), backward = out.grad * local_derivative
+    def _unary(self, result, local_grad):
+        out = Tensor(result, (self,))
+        def _backward():
+            if self.grad: self.grad += out.grad * local_grad
+        out._backward = _backward
+        return out
 
     def __add__(self, other):
-        if isinstance(other, Matrix):
-            assert self.shape() == other.shape() # elementwise addition for same shape matrices
-            out = Matrix(
-                [[a + b for a, b in zip(row_a, row_b)] for row_a, row_b in zip(self.data, other.data)],
-                (self, other),
-            )
-            out._backward = lambda: Matrix._elementwise_backward(out, (self, other), lambda g, a, b: (g, g)) 
-            return out
-        else:
-            out = Matrix(
-                [[a + other for a in row] for row in self.data],
-                (self,),
-            )
-            out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g,)) 
-            return out
-    
-    def __mul__(self, other):
-        if isinstance(other, Matrix):
-            assert self.shape()[1] == other.shape()[0] # NxP for self, PxM for other
+        if isinstance(other, Tensor):
+            out = Tensor(self.data + other.data, (self, other))
             def _backward():
-                # dL/dself = dL/dout * dout/dself = out.grad @ other.T
-                # dL/dother = dL/dout * dout/dother = self.T @ out.grad
-                if self.grad is not None:
-                    self.grad = [[sg + sum(g * b for g, b in zip(out_row, col_b))                                                                                    
-                                    for sg, col_b in zip(sg_row, zip(*other.data))]                                                                                  
-                                        for sg_row, out_row in zip(self.grad, out.grad)]
-                if other.grad is not None: 
-                    other.grad = [[og + sum(a * g for a, g in zip(col_a, col_g))                                                                                     
-                                for og, col_g in zip(og_row, zip(*out.grad))]                                                                                     
-                                        for og_row, col_a in zip(other.grad, zip(*self.data))]      
-            out = Matrix(
-                # multiply rowA by colB for each rowA in self and colB in other and sum to get each element of the output
-                [[sum(a * b for a, b in zip(row_a, col_b)) for col_b in zip(*other.data)] for row_a in self.data],
-                (self, other),
-            )
+                if self.grad:  self.grad += out.grad
+                if other.grad: other.grad += out.grad
             out._backward = _backward
             return out
         else:
-            out = Matrix(
-                [[a * other for a in row] for row in self.data],
-                (self,),
-            )
-            out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g * other,))
-            # scalar multiplication just scales the gradient by other
-            return out  
+            out = Tensor(self.data + other, (self,))
+            def _backward():
+                if self.grad: self.grad += out.grad
+            out._backward = _backward
+            return out
 
-    def __pow__(self, other): 
-        out = Matrix([[a ** other for a in row] for row in self.data],(self,),)
-        out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g * other * a ** (other - 1),)) 
-        # power rule: d(a^b)/da = b * a^(b-1) -- gradient scaled by other and a^(other-1)
-        return out
-    
-    def log(self):
-        out = Matrix([[math.log(a) for a in row] for row in self.data],(self,),)
-        out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g / a,)) 
-        # derivative of log(a) is 1/a -- gradient scaled by 1/a
-        return out
+    def __mul__(self, other):
+        if isinstance(other, Tensor): # matmul: self @ other
+            out = Tensor(self.data @ other.data, (self, other))
+            def _backward():
+                if self.grad:  self.grad += out.grad @ other.data.T()
+                if other.grad: other.grad += self.data.T() @ out.grad
+            out._backward = _backward
+            return out
+        else: return self._unary(self.data * other, other)  # scalar multiply
 
-    def exp(self):
-        out = Matrix([[math.exp(a) for a in row] for row in self.data],(self,),)
-        out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g * math.exp(a),)) 
-        # derivative of exp(a) is exp(a) -- gradient scaled by exp(a)
-        return out
-
+    def __pow__(self, n):   return self._unary(self.data ** n, self.data ** (n - 1) * n)
+    def log(self):          return self._unary(self._apply(math.log), self.data ** -1)
+    def exp(self):          e = self._apply(math.exp); return self._unary(e, e)
+    def tanh(self):         t = self._apply(math.tanh); return self._unary(t, self._ones() - t * t)
     def silu(self):
-        # x times sigmoid(x) or x / (1 + exp(-x))
-        out = Matrix([[a / (1 + math.exp(-a)) for a in row] for row in self.data],(self,),)
-        out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g * (1 / (1 + math.exp(-a)) + a * math.exp(-a) / ((1 + math.exp(-a)) ** 2)),)) 
-        # derivative of silu(a) is sigmoid(a) + a * sigmoid'(a) -- gradient scaled by that
-        # sigmoid'(a) = sigmoid(a) * (1 - sigmoid(a))
-        # yes I fused SiLU, but you could do it separately if needed (autograd handles)
-        return out
-    
-    def tanh(self):
-        out = Matrix([[math.tanh(a) for a in row] for row in self.data],(self,),)
-        out._backward = lambda: Matrix._elementwise_backward(out, (self,), lambda g, a: (g * (1 - math.tanh(a) ** 2),)) 
-        # derivative of tanh(a) is 1 - tanh(a)^2 -- gradient scaled by that
-        # some more fusing because faster for GELU
-        return out
+        sig = self._apply(lambda a: 1.0 / (1.0 + math.exp(-a)))
+        return self._unary(self.data * sig, sig + self.data * sig * (self._ones() - sig)) # fused silu for speed
 
-    def GELU(self):
-        return 0.5 * self * (1 + (math.sqrt(2 / math.pi) * (self + 0.044715 * self**3)).tanh()) # this is the exact GELU formula, but the derivative is a mess so not fusing it
+    def GELU(self): return 0.5 * self * (1 + (math.sqrt(2 / math.pi) * (self + 0.044715 * self**3)).tanh())
 
-    def __neg__(self): return self * -1
-    def __radd__(self, other): return self + other
-    def __sub__(self, other): return self + (-other)
-    def __rsub__(self, other): return other + (-self)
-    def __rmul__(self, other): return self * other
-    def __truediv__(self, other): return self * other**-1
-    def __rtruediv__(self, other): return other * self**-1
-    
     def __getitem__(self, idx):
-        # [row] or [row, col]
         if not isinstance(idx, tuple): idx = (idx, slice(None))
-        rows = range(len(self.data))[idx[0]] if isinstance(idx[0], slice) else [idx[0]]                                                           
-        cols = range(len(self.data[0]))[idx[1]] if isinstance(idx[1], slice) else [idx[1]] 
-        out = Matrix([[self.data[r][c] for c in cols] for r in rows], children=(self,))  
+        rows = list(range(self.data.shape()[0])[idx[0]] if isinstance(idx[0], slice) else [idx[0]])
+        cols = list(range(self.data.shape()[1])[idx[1]] if isinstance(idx[1], slice) else [idx[1]])
+        out = Tensor(self.data[idx], (self,))
         def _backward():
-            if self.grad is not None:
-                for i, r in enumerate(rows):
-                    for j, c in enumerate(cols):
-                        self.grad[r][c] += out.grad[i][j]
-        out.backward = _backward
+            if self.grad: self.grad.acc_at(rows, cols, out.grad)
+        out._backward = _backward
         return out
-    
-
-    def shape(self):
-        return (len(self.data), len(self.data[0]) if self.data else 0)
-    
 
     @staticmethod
-    def concat(*matrices, axis=0):
-        if axis == 0:
-            data = sum((m.data for m in matrices), [])
-        else:
-            data = [sum((m.data[i] for m in matrices), []) for i in range(len(matrices[0].data))]
-        out = Matrix(data, children = tuple(matrices))
+    def cat(*matrices, axis=0):
+        out = Tensor(Raw.concat(*[m.data for m in matrices], axis=axis), tuple(matrices))
         def _backward():
             pos = 0
             for m in matrices:
-                size = len(m.data) if axis == 0 else len(m.data[0])
-                if m.grad is not None:
-                    for i in range(len(m.data)):
-                        for j in range(len(m.data[0])):
-                            if axis == 0:
-                                m.grad[i][j] += out.grad[pos + i][j]
-                            else:
-                                m.grad[i][j] += out.grad[i][pos + j]
-                size = len(m.data) if axis == 0 else len(m.data[0])
-                pos += size
+                s = m.data.shape()[axis]
+                if m.grad:
+                    if axis == 0: m.grad += out.grad[pos:pos+s]
+                    else:         m.grad += out.grad[:, pos:pos+s]
+                pos += s
         out._backward = _backward
         return out
-    @staticmethod
-    def vals_like(matrix, val):
-        return [([val] * len(matrix.data[0])) for _ in range(len(matrix.data))]
-    
-    @staticmethod
-    def _elementwise_backward(out, children, grad_fn):
-      for i in range(len(out.data)):
-          for j in range(len(out.data[0])):
-              g = out.grad[i][j]
-              vals = tuple(c.data[i][j] for c in children)
-              grads = grad_fn(g, *vals)
-              for child, cg in zip(children, grads):
-                  if child.grad is not None:
-                    child.grad[i][j] += cg
+
     def backward(self):
-        # non-recursive to prevent any potential issues
         topo = []
         visited = set()
         stack = [(self, False)]
@@ -254,9 +180,9 @@ class Matrix:
                 visited.add(id(v))
                 stack.append((v, True))
                 for c in v._children: stack.append((c, False))
-        self.grad = Matrix.vals_like(self, 1)
-        for i in reversed(topo):
-            i._backward()
+        self.grad = Raw.vals_like(*self.data.shape(), val=1)
+        for v in reversed(topo):
+            v._backward()
     
 
         
@@ -347,19 +273,19 @@ HEAD_DIM = N_EMBED // N_HEAD
 HEAD_PROTOTYPES = 10 # 10 for 10 classes! 
 # we simplify the heads to just be linear projections instead of an MLP
 state_dict = {
-    'patch_embed': Matrix.random_init(PATCH_SIZE * PATCH_SIZE, N_EMBED), # patch embedding weights, square size to embed dim
-    'DINO_head': Matrix.random_init(N_EMBED, HEAD_PROTOTYPES), # projects from embed dim to prototype dim for DINO loss
-    'iBOT_head': Matrix.random_init(N_EMBED, HEAD_PROTOTYPES) # projects from embed dim to prototype dim for iBOT loss
+    'patch_embed': Tensor.random_init(PATCH_SIZE * PATCH_SIZE, N_EMBED), # patch embedding weights, square size to embed dim
+    'DINO_head': Tensor.random_init(N_EMBED, HEAD_PROTOTYPES), # projects from embed dim to prototype dim for DINO loss
+    'iBOT_head': Tensor.random_init(N_EMBED, HEAD_PROTOTYPES) # projects from embed dim to prototype dim for iBOT loss
 }
 for i in range(N_LAYER):
-    state_dict[f'layer{i}.atten_wq'] = Matrix.random_init(N_EMBED, N_EMBED) # attention weight matrices for each layer
-    state_dict[f'layer{i}.atten_wk'] = Matrix.random_init(N_EMBED, N_EMBED)
-    state_dict[f'layer{i}.atten_wv'] = Matrix.random_init(N_EMBED, N_EMBED)
-    state_dict[f'layer{i}.atten_wo'] = Matrix.random_init(N_EMBED, N_EMBED)
-    state_dict[f'layer{i}.mlp_w1'] = Matrix.random_init(N_EMBED, N_EMBED * 4) # MLP weight matrices for each layer, we use a 4x expansion for the hidden layer
-    state_dict[f'layer{i}.mlp_w2'] = Matrix.random_init(N_EMBED * 4, N_EMBED)
-    state_dict[f'layer{i}.layernorm_gamma'] = Matrix.random_init(1, 1)
-    state_dict[f'layer{i}.layernorm_beta'] = Matrix.random_init(1, 1)
+    state_dict[f'layer{i}.atten_wq'] = Tensor.random_init(N_EMBED, N_EMBED) # attention weight matrices for each layer
+    state_dict[f'layer{i}.atten_wk'] = Tensor.random_init(N_EMBED, N_EMBED)
+    state_dict[f'layer{i}.atten_wv'] = Tensor.random_init(N_EMBED, N_EMBED)
+    state_dict[f'layer{i}.atten_wo'] = Tensor.random_init(N_EMBED, N_EMBED)
+    state_dict[f'layer{i}.mlp_w1'] = Tensor.random_init(N_EMBED, N_EMBED * 4) # MLP weight matrices for each layer, we use a 4x expansion for the hidden layer
+    state_dict[f'layer{i}.mlp_w2'] = Tensor.random_init(N_EMBED * 4, N_EMBED)
+    state_dict[f'layer{i}.layernorm_gamma'] = Tensor.random_init(1, 1)
+    state_dict[f'layer{i}.layernorm_beta'] = Tensor.random_init(1, 1)
 
 
 
