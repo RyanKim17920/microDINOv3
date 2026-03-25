@@ -27,15 +27,73 @@ _, n, rows, cols = struct.unpack('>IIII', raw[:16])
 images = [[[b / 255.0 for b in raw[16 + i * rows * cols + r * cols : 16 + i * rows * cols + (r + 1) * cols]] for r in range(rows)] for i in range(n)]
 print(f"num images: {len(images)}, size: {rows}x{cols}")
 
+class Data:
+    __slots__ = ('data',)
+    def __init__(self, data): self.data = data
+    @classmethod
+    def vals_like(cls, rows, cols, val=0): return cls([[val] * cols for _ in range(rows)])   
+    def shape(self): return (len(self.data), len(self.data[0]) if self.data else 0)
+
+    def __add__(self, other): 
+        if isinstance(other, Data): return Data([[a + b for a, b in zip(row_a, row_b)] for row_a, row_b in zip(self.data, other.data)])
+        else: return Data([[a + other for a in row] for row in self.data])
+    def __neg__(self): return Data([[-a for a in row] for row in self.data])              
+    def __matmul__(self, other): 
+        oT = list(zip(*other.data))                                                                                       
+        return Data([[sum(a*b for a,b in zip(row, col)) for col in oT] for row in self.data])
+    def __pow__(self, val): return Data([[a**val for a in row] for row in self.data])
+    def __radd__(self, other): return self + other
+    def __sub__(self, other): return self + (-other)
+    def __rsub__(self, other): return other + (-self)
+    def __rmul__(self, other): return self * other
+    def __truediv__(self, other): return self * other**-1
+    def __rtruediv__(self, other): return other * self**-1
+    def __iadd__(self, other):
+        if isinstance(other, Data):
+          for i in range(len(self.data)):
+              for j in range(len(self.data[0])):
+                  self.data[i][j] += other.data[i][j]
+        return self
+    def __mul__(self, other):
+        if isinstance(other, Data): return Data([[a * b for a, b in zip(ra, rb)] for ra, rb in zip(self.data, other.data)]) # hadamard multiplication
+        else: return Data([[a * other for a in row] for row in self.data])
+    def __getitem__(self, idx):
+      if not isinstance(idx, tuple): idx = (idx, slice(None))
+      rows = self.data[idx[0]] if isinstance(idx[0], slice) else [self.data[idx[0]]]
+      if isinstance(idx[1], slice): return Data([row[idx[1]] for row in rows])
+      else: return Data([[row[idx[1]]] for row in rows])
+
+    def acc_at(self, rows, cols, other):  # scatter accumulate for slice backward
+      for i, r in enumerate(rows):
+          for j, c in enumerate(cols):
+              self.data[r][c] += other.data[i][j]
+    def T(self):
+        return Data([list(col) for col in zip(*self.data)])
+    @staticmethod
+    def concat(*datas, axis=0):
+        if axis == 0:                                                                                                     
+            out = []                                                                                                      
+            for d in datas: out.extend(d.data)       
+            return Data(out)                                                                                              
+        else:
+            return Data([sum([d.data[i] for d in datas], []) for i in range(len(datas[0].data))])      
+        
+
+
 class Matrix:
     __slots__ = ('data', 'grad', '_children', '_backward', 'requires_grad')
 
-    def __init__(self, data, children=(), _backward=None, requires_grad = True):
+    def __init__(self, data, children=(), _backward=None, requires_grad=True):
         self.data = data                                                   # list of scalar values of this node calculated during forward pass MxN shape
-        self.grad = self.vals_like(self, 0) if requires_grad else None     # list of derivatives of the loss w.r.t. this node, calculated in backward pass
+        self.grad = Matrix.vals_like(self, 0) if requires_grad else None     # list of derivatives of the loss w.r.t. this node, calculated in backward pass
         self._children = children                                          # children of this node in the computation graph
         self._backward = _backward                                         # backward function for gradient computation
         self.requires_grad = requires_grad
+
+
+    @classmethod
+    def random_init(cls, rows, cols, std=.08, requires_grad=True):
+        return cls([[random.gauss(0, std) for _ in range(cols)] for _ in range(rows)], requires_grad=requires_grad)
 
     def __add__(self, other):
         if isinstance(other, Matrix):
@@ -129,11 +187,50 @@ class Matrix:
     def __truediv__(self, other): return self * other**-1
     def __rtruediv__(self, other): return other * self**-1
     
-    def vals_like(self, matrix, val):
-        return [([val] * len(matrix.data[0])) for _ in range(len(matrix.data))]
+    def __getitem__(self, idx):
+        # [row] or [row, col]
+        if not isinstance(idx, tuple): idx = (idx, slice(None))
+        rows = range(len(self.data))[idx[0]] if isinstance(idx[0], slice) else [idx[0]]                                                           
+        cols = range(len(self.data[0]))[idx[1]] if isinstance(idx[1], slice) else [idx[1]] 
+        out = Matrix([[self.data[r][c] for c in cols] for r in rows], children=(self,))  
+        def _backward():
+            if self.grad is not None:
+                for i, r in enumerate(rows):
+                    for j, c in enumerate(cols):
+                        self.grad[r][c] += out.grad[i][j]
+        out.backward = _backward
+        return out
     
+
     def shape(self):
         return (len(self.data), len(self.data[0]) if self.data else 0)
+    
+
+    @staticmethod
+    def concat(*matrices, axis=0):
+        if axis == 0:
+            data = sum((m.data for m in matrices), [])
+        else:
+            data = [sum((m.data[i] for m in matrices), []) for i in range(len(matrices[0].data))]
+        out = Matrix(data, children = tuple(matrices))
+        def _backward():
+            pos = 0
+            for m in matrices:
+                size = len(m.data) if axis == 0 else len(m.data[0])
+                if m.grad is not None:
+                    for i in range(len(m.data)):
+                        for j in range(len(m.data[0])):
+                            if axis == 0:
+                                m.grad[i][j] += out.grad[pos + i][j]
+                            else:
+                                m.grad[i][j] += out.grad[i][pos + j]
+                size = len(m.data) if axis == 0 else len(m.data[0])
+                pos += size
+        out._backward = _backward
+        return out
+    @staticmethod
+    def vals_like(matrix, val):
+        return [([val] * len(matrix.data[0])) for _ in range(len(matrix.data))]
     
     @staticmethod
     def _elementwise_backward(out, children, grad_fn):
@@ -157,9 +254,12 @@ class Matrix:
                 visited.add(id(v))
                 stack.append((v, True))
                 for c in v._children: stack.append((c, False))
-        self.grad = self.vals_like(self, 1)
+        self.grad = Matrix.vals_like(self, 1)
         for i in reversed(topo):
             i._backward()
+    
+
+        
 
 
 
@@ -216,22 +316,24 @@ def blur(image, kernel_size=5, sigma=(0.1, 2.0)):
             out[y][x] = acc
     return out
 
-def brightness_jitter(image):
-    factor = random.uniform(0.5, 1.5)  # Random brightness factor
-    return [[min(max(pixel * factor, 0), 1) for pixel in row] for row in image]
+def brightness_jitter(image): return [[min(max(pixel * random.uniform(0.5, 1.5) , 0), 1) for pixel in row] for row in image]
 
-def gaussian_noise(image, mean=0, std=0.1):
-    return [[min(max(pixel + random.gauss(mean, std), 0), 1) for pixel in row] for row in image]
+def gaussian_noise(image, mean=0, std=0.1): return [[min(max(pixel + random.gauss(mean, std), 0), 1) for pixel in row] for row in image]
 
-def augment_image(image):
-    for func, prob in [(blur, GLOBAL_BLUR_PROB), (brightness_jitter, GLOBAL_BRIGHTNESS_JITTER_PROB), (gaussian_noise, GLOBAL_GAUSSIAN_NOISE_PROB)]:
-        if random.random() < prob:
-            image = func(image)
+def augment_image(image, local=False):
+    if local:
+        for func, prob in [(blur, LOCAL_BLUR_PROB), (brightness_jitter, LOCAL_BRIGHTNESS_JITTER_PROB), (gaussian_noise, LOCAL_GAUSSIAN_NOISE_PROB)]:
+            if random.random() < prob:
+                image = func(image)
+    else:
+        for func, prob in [(blur, GLOBAL_BLUR_PROB), (brightness_jitter, GLOBAL_BRIGHTNESS_JITTER_PROB), (gaussian_noise, GLOBAL_GAUSSIAN_NOISE_PROB)]:
+            if random.random() < prob:
+                image = func(image)
     return image
 
 def get_crops(image):
     global_crops = [crop(augment_image(image), GLOBAL_CROP_SIZE) for _ in range(GLOBAL_CROPS)]
-    local_crops = [crop(augment_image(image), LOCAL_CROP_SIZE) for _ in range(LOCAL_CROPS)]
+    local_crops = [crop(augment_image(image, local=True), LOCAL_CROP_SIZE) for _ in range(LOCAL_CROPS)]
     return global_crops, local_crops
 
 
@@ -240,6 +342,25 @@ N_EMBED = 16
 N_LAYER = 1
 N_HEAD = 4
 HEAD_DIM = N_EMBED // N_HEAD
+
+
+HEAD_PROTOTYPES = 10 # 10 for 10 classes! 
+# we simplify the heads to just be linear projections instead of an MLP
+state_dict = {
+    'patch_embed': Matrix.random_init(PATCH_SIZE * PATCH_SIZE, N_EMBED), # patch embedding weights, square size to embed dim
+    'DINO_head': Matrix.random_init(N_EMBED, HEAD_PROTOTYPES), # projects from embed dim to prototype dim for DINO loss
+    'iBOT_head': Matrix.random_init(N_EMBED, HEAD_PROTOTYPES) # projects from embed dim to prototype dim for iBOT loss
+}
+for i in range(N_LAYER):
+    state_dict[f'layer{i}.atten_wq'] = Matrix.random_init(N_EMBED, N_EMBED) # attention weight matrices for each layer
+    state_dict[f'layer{i}.atten_wk'] = Matrix.random_init(N_EMBED, N_EMBED)
+    state_dict[f'layer{i}.atten_wv'] = Matrix.random_init(N_EMBED, N_EMBED)
+    state_dict[f'layer{i}.atten_wo'] = Matrix.random_init(N_EMBED, N_EMBED)
+    state_dict[f'layer{i}.mlp_w1'] = Matrix.random_init(N_EMBED, N_EMBED * 4) # MLP weight matrices for each layer, we use a 4x expansion for the hidden layer
+    state_dict[f'layer{i}.mlp_w2'] = Matrix.random_init(N_EMBED * 4, N_EMBED)
+    state_dict[f'layer{i}.layernorm_gamma'] = Matrix.random_init(1, 1)
+    state_dict[f'layer{i}.layernorm_beta'] = Matrix.random_init(1, 1)
+
 
 
 """
