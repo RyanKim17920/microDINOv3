@@ -1,8 +1,8 @@
 """
-The almost-most atomic way to train and run inference for DINOv3 in pure, dependency-free Python.
+The almost atomic way to train and run inference for DINOv3 in pure, dependency-free Python.
 Inspired by Karpathy's microGPT.py
 This file is the complete algorithm.
-Everything else is just efficiency (well I did apply some efficiency to convert Value to Tensor so it can actually run).
+Efficiency is applied for further educational values (improved autograd with matrixes, fused modules)
 """
 
 import os
@@ -10,6 +10,7 @@ import math
 import random
 import gzip
 import struct
+import copy
 
 random.seed(42)
 
@@ -24,7 +25,7 @@ raw = gzip.decompress(data)
 
 # parse the raw MNIST data into a list of images that are normalized
 _, n, rows, cols = struct.unpack('>IIII', raw[:16])
-images = [[[b / 255.0 for b in raw[16 + i * rows * cols + r * cols : 16 + i * rows * cols + (r + 1) * cols]] for r in range(rows)] for i in range(n)]
+images = [Raw([[b / 255.0 for b in raw[16 + i * rows * cols + r * cols : 16 + i * rows * cols + (r + 1) * cols]] for r in range(rows)]) for i in range(n)]
 print(f"num images: {len(images)}, size: {rows}x{cols}")
 
 #basic arithmetic operators that work across data and matrices
@@ -71,8 +72,9 @@ class Raw(Arithmetic):
       for i, r in enumerate(rows):
           for j, c in enumerate(cols):
               self.data[r][c] += other.data[i][j]
-    def T(self):
-        return Raw([list(col) for col in zip(*self.data)])
+    def T(self): return Raw([list(col) for col in zip(*self.data)])
+    def sum_rows(self): return Raw([[sum(row)] * len(row) for row in self.data])
+    def clamp(self, lo=0, hi=1): return Raw([[max(lo, min(hi, a)) for a in row] for row in self.data])
     @staticmethod
     def concat(*datas, axis=0):
         if axis == 0:                                                                                                     
@@ -145,6 +147,22 @@ class Tensor(Arithmetic):
 
     def GELU(self): return 0.5 * self * (1 + (math.sqrt(2 / math.pi) * (self + 0.044715 * self**3)).tanh())
 
+    def softmax(self):
+        # fusing this for speed. 
+        # subtract max per row for numerical stability
+        maxes = Raw([[max(row)] * len(row) for row in self.data.data])
+        e = (self.data - maxes)._apply(math.exp) # subtracting maxes as softmax is shift-invariant
+        s = e * Raw([[1.0 / sum(row)] * len(row) for row in e.data])
+
+        out = Tensor(s, (self,))
+        def _backward():
+            if self.grad:
+                self.grad += s * (out.grad - (out.grad * s).sum_rows())
+                # strong fusing of the softmax
+        out.backward = _backward
+        return out
+
+
     def __getitem__(self, idx):
         if not isinstance(idx, tuple): idx = (idx, slice(None))
         rows = list(range(self.data.shape()[0])[idx[0]] if isinstance(idx[0], slice) else [idx[0]])
@@ -183,11 +201,6 @@ class Tensor(Arithmetic):
         self.grad = Raw.vals_like(*self.data.shape(), val=1)
         for v in reversed(topo):
             v._backward()
-    
-
-        
-
-
 
 # Augmentations are vital for DINOv3
 GLOBAL_CROP_SIZE              = 24  # DINOv3 uses 224 global out of 256, but we're using MNIST
@@ -205,15 +218,14 @@ GLOBAL_GAUSSIAN_NOISE_PROB    = 0.1
 LOCAL_GAUSSIAN_NOISE_PROB     = 0.3
 
 def crop(image, size):
-    # Randomly crop a square of the given size from the image
-    x = random.randint(0, len(image[0]) - size)
-    y = random.randint(0, len(image) - size)
-    return [row[x:x+size] for row in image[y:y+size]]
+    h, w = image.shape()
+    x = random.randint(0, w - size)
+    y = random.randint(0, h - size)
+    return image[y:y+size, x:x+size]
 
 def blur(image, kernel_size=5, sigma=(0.1, 2.0)):
     kh, kw = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
     sigma_val = random.uniform(sigma[0], sigma[1]) if isinstance(sigma, (tuple, list)) else sigma
-    sigma_x = sigma_y = sigma_val
 
     # Build normalized 2D Gaussian kernel.
     ry, rx = kh // 2, kw // 2
@@ -221,16 +233,15 @@ def blur(image, kernel_size=5, sigma=(0.1, 2.0)):
     for y in range(-ry, ry + 1):
         row = []
         for x in range(-rx, rx + 1):
-            val = math.exp(-((x * x) / (2.0 * sigma_x * sigma_x) + (y * y) / (2.0 * sigma_y * sigma_y)))
+            val = math.exp(-((x * x) / (2.0 * sigma_val * sigma_val) + (y * y) / (2.0 * sigma_val * sigma_val)))
             row.append(val)
         kernel.append(row)
     ksum = sum(sum(row) for row in kernel)
     kernel = [[v / ksum for v in row] for row in kernel]
 
-    # Convolve with border clamping.
-    h = len(image)
-    w = len(image[0])
-    out = [[0.0 for _ in range(w)] for _ in range(h)]
+    h, w = image.shape()
+    d = image.data
+    out = [[0.0] * w for _ in range(h)]
     for y in range(h):
         for x in range(w):
             acc = 0.0
@@ -238,13 +249,17 @@ def blur(image, kernel_size=5, sigma=(0.1, 2.0)):
                 for kx in range(kw):
                     iy = min(max(y + ky - ry, 0), h - 1)
                     ix = min(max(x + kx - rx, 0), w - 1)
-                    acc += image[iy][ix] * kernel[ky][kx]
+                    acc += d[iy][ix] * kernel[ky][kx]
             out[y][x] = acc
-    return out
+    return Raw(out)
 
-def brightness_jitter(image): return [[min(max(pixel * random.uniform(0.5, 1.5) , 0), 1) for pixel in row] for row in image]
+def brightness_jitter(image):
+    h, w = image.shape()
+    return (image * Raw([[random.uniform(0.5, 1.5) for _ in range(w)] for _ in range(h)])).clamp(0, 1)
 
-def gaussian_noise(image, mean=0, std=0.1): return [[min(max(pixel + random.gauss(mean, std), 0), 1) for pixel in row] for row in image]
+def gaussian_noise(image, mean=0, std=0.1):
+    h, w = image.shape()
+    return (image + Raw([[random.gauss(mean, std) for _ in range(w)] for _ in range(h)])).clamp(0, 1)
 
 def augment_image(image, local=False):
     if local:
@@ -263,6 +278,7 @@ def get_crops(image):
     return global_crops, local_crops
 
 
+
 PATCH_SIZE = 4
 N_EMBED = 16
 N_LAYER = 1
@@ -270,23 +286,64 @@ N_HEAD = 4
 HEAD_DIM = N_EMBED // N_HEAD
 
 
-HEAD_PROTOTYPES = 10 # 10 for 10 classes! 
+HEAD_PROTOTYPES = 10 # 10 for 10 classes!
 # we simplify the heads to just be linear projections instead of an MLP
-state_dict = {
+student_state_dict = {
     'patch_embed': Tensor.random_init(PATCH_SIZE * PATCH_SIZE, N_EMBED), # patch embedding weights, square size to embed dim
-    'DINO_head': Tensor.random_init(N_EMBED, HEAD_PROTOTYPES), # projects from embed dim to prototype dim for DINO loss
-    'iBOT_head': Tensor.random_init(N_EMBED, HEAD_PROTOTYPES) # projects from embed dim to prototype dim for iBOT loss
+    'CLS_token': Tensor(Raw.random_init(1, N_EMBED, std=0.02)),         # learned CLS token, no registers needed at this scale
+    'DINO_head': Tensor.random_init(N_EMBED, HEAD_PROTOTYPES),          # projects CLS embed to prototype dim for DINO loss
+    'iBOT_head': Tensor.random_init(N_EMBED, HEAD_PROTOTYPES),          # projects patch embeds to prototype dim for iBOT loss
+    # backbone output norm (shared: applied to everything for global crops, patches-only for local crops)
+    'norm_gamma': Tensor(Raw.vals_like(1, N_EMBED, val=1)),
+    'norm_beta':  Tensor(Raw.vals_like(1, N_EMBED, val=0)),
+    # dedicated local CLS norm (paper Sec 3.2: separate norm for local crop CLS tokens during training)
+    'local_cls_norm_gamma': Tensor(Raw.vals_like(1, N_EMBED, val=1)),
+    'local_cls_norm_beta':  Tensor(Raw.vals_like(1, N_EMBED, val=0)),
 }
 for i in range(N_LAYER):
-    state_dict[f'layer{i}.atten_wq'] = Tensor.random_init(N_EMBED, N_EMBED) # attention weight matrices for each layer
-    state_dict[f'layer{i}.atten_wk'] = Tensor.random_init(N_EMBED, N_EMBED)
-    state_dict[f'layer{i}.atten_wv'] = Tensor.random_init(N_EMBED, N_EMBED)
-    state_dict[f'layer{i}.atten_wo'] = Tensor.random_init(N_EMBED, N_EMBED)
-    state_dict[f'layer{i}.mlp_w1'] = Tensor.random_init(N_EMBED, N_EMBED * 4) # MLP weight matrices for each layer, we use a 4x expansion for the hidden layer
-    state_dict[f'layer{i}.mlp_w2'] = Tensor.random_init(N_EMBED * 4, N_EMBED)
-    state_dict[f'layer{i}.layernorm_gamma'] = Tensor.random_init(1, 1)
-    state_dict[f'layer{i}.layernorm_beta'] = Tensor.random_init(1, 1)
+    student_state_dict[f'layer{i}.atten_wq'] = Tensor.random_init(N_EMBED, N_EMBED) # attention weight matrices for each layer
+    student_state_dict[f'layer{i}.atten_wk'] = Tensor.random_init(N_EMBED, N_EMBED)
+    student_state_dict[f'layer{i}.atten_wv'] = Tensor.random_init(N_EMBED, N_EMBED)
+    student_state_dict[f'layer{i}.atten_wo'] = Tensor.random_init(N_EMBED, N_EMBED)
+    student_state_dict[f'layer{i}.mlp_w1']   = Tensor.random_init(N_EMBED, N_EMBED * 4) # MLP weight matrices, 4x expansion
+    student_state_dict[f'layer{i}.mlp_w2']   = Tensor.random_init(N_EMBED * 4, N_EMBED)
+    # pre-norm: norm1 before attention, norm2 before MLP (gamma=1, beta=0 init)
+    student_state_dict[f'layer{i}.norm1_gamma'] = Tensor(Raw.vals_like(1, N_EMBED, val=1))
+    student_state_dict[f'layer{i}.norm1_beta']  = Tensor(Raw.vals_like(1, N_EMBED, val=0))
+    student_state_dict[f'layer{i}.norm2_gamma'] = Tensor(Raw.vals_like(1, N_EMBED, val=1))
+    student_state_dict[f'layer{i}.norm2_beta']  = Tensor(Raw.vals_like(1, N_EMBED, val=0))
+    # layer-scale skipped because only one layer
 
+def vit(image, state_dict, train=True):
+    h, w = image.shape()
+    H, W = h // PATCH_SIZE, w // PATCH_SIZE
+
+    x = [state_dict['CLS_token']]
+    for i in range(H):
+        for j in range(W):
+            patch = image[i * PATCH_SIZE:(i + 1) * PATCH_SIZE, j * PATCH_SIZE:(j + 1) * PATCH_SIZE]
+            x.append(Tensor([sum(patch.data, [])]) @ state_dict['patch_embed'])
+            
+    x = Tensor.cat(x)
+
+    for layer in range(N_LAYER):
+        x_residual = x
+
+print(f'Parameters: {sum(x.shape[0] * x.shape[1] for x in student_state_dict.values())}')
+
+
+
+# Let there be Adam, the blessed optimizer and its buffers
+learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
+m = [Raw.vals_like(x.shape[0], x.shape[1]) for x in student_state_dict.values*()] # first moment buffer
+v = [Raw.vals_like(x.shape[0], x.shape[1]) for x in student_state_dict.values*()] # second moment buffer
+
+num_steps = 1000
+for step in range(num_steps):
+    img = images[step % len(images)]
+    global_crops, local_crops = get_crops(img)
+    student_embed = vit(img, student_state_dict)
+    
 
 
 """
@@ -301,8 +358,6 @@ for i in range(N_LAYER):
         - CLS token [ ]
         - MHSA [ ]
         - RoPE [ ]
-        - RMSNorm [ ]
-        - MLP block [ ]
         - L2-normalized output projection heads [ ]
     - DINO CORE:
         - Student model (Value weights, recieves gradients) [ ]
