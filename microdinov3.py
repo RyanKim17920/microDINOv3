@@ -1,8 +1,8 @@
 """
-The almost atomic way to train and run inference for DINOv3 in pure, dependency-free Python.
+The almost-fully atomic way to train and run inference for DINOv3 in pure, dependency-free Python.
 Inspired by Karpathy's microGPT.py
 This file is the complete algorithm.
-Efficiency is applied for further educational values (improved autograd with matrixes, fused modules)
+Efficiency is applied for further educational value and runnable speed (improved autograd with matrixes, fused modules)
 """
 
 import os
@@ -38,7 +38,7 @@ class Arithmetic:
       def __truediv__(self, other): return self * other**-1
       def __rtruediv__(self, other): return other * self**-1  
 
-# holding raw data that can be manipulated
+# holding raw data that can be manipulated, somewhat more similar to Pytorch holding raw data and autograd
 class Raw(Arithmetic):
     __slots__ = ('data',)
     def __init__(self, data): self.data = data
@@ -128,15 +128,22 @@ class Tensor(Arithmetic):
             return out
 
     def __mul__(self, other):
-        if isinstance(other, Tensor): # matmul: self @ other
-            out = Tensor(self.data @ other.data, (self, other))
+        if isinstance(other, Tensor): # hadamard multiplication
+            out = Tensor(self.data * other.data, (self, other))
             def _backward():
-                if self.grad:  self.grad += out.grad @ other.data.T()
-                if other.grad: other.grad += self.data.T() @ out.grad
+                if self.grad:  self.grad += out.grad * other.data
+                if other.grad: other.grad += out.grad * self.data
             out._backward = _backward
             return out
         else: return self._unary(self.data * other, other)  # scalar multiply
 
+    def __matmul__(self, other):
+        out = Tensor(self.data @ other.data, (self, other))
+        def _backward():
+            if self.grad:  self.grad += out.grad @ other.data.T()
+            if other.grad: other.grad += self.data.T() @ out.grad
+        out._backward = _backward
+        return out
     def __pow__(self, n):   return self._unary(self.data ** n, self.data ** (n - 1) * n)
     def log(self):          return self._unary(self._apply(math.log), self.data ** -1)
     def exp(self):          e = self._apply(math.exp); return self._unary(e, e)
@@ -147,21 +154,52 @@ class Tensor(Arithmetic):
 
     def GELU(self): return 0.5 * self * (1 + (math.sqrt(2 / math.pi) * (self + 0.044715 * self**3)).tanh())
 
+    def row_sum(self):
+        out = Tensor(self.data.sum_rows(), (self,))
+        def _backward():
+            if self.grad:  Raw([[sum(row)] * len(row) for row in out.grad.data])
+        out._backward = _backward
+        return out
+
+    def sum_all(self):
+        total = sum(sum(row) for row in self.data.data)
+        out = Tensor(Raw([[total]]), (self,))
+        def _backward():
+            if self.grad: self.grad += Raw.vals_like(*self.data.shape(), val=out.grad.data[0][0])
+        out._backward = _backward
+        return out
+
+    def repeat_rows(self, n):
+        # broadcasting fixes, unfortunately could not implement strides like PyTorch without unnecessary complexity
+        out = Tensor(Raw([self.data.data[0][:] for _ in range(n)]), (self,))
+        def _backward():
+            if self.grad:
+                for j in range(self.data.shape()[1]):
+                    self.grad.data[0][j] += sum(out.grad.data[i][j] for i in range(n))
+        out._backward = _backward
+        return out
+
     def softmax(self):
         # fusing this for speed. 
         # subtract max per row for numerical stability
         maxes = Raw([[max(row)] * len(row) for row in self.data.data])
-        e = (self.data - maxes)._apply(math.exp) # subtracting maxes as softmax is shift-invariant
-        s = e * Raw([[1.0 / sum(row)] * len(row) for row in e.data])
+        e = Raw([[math.exp(a) for a in row] for row in (self.data - maxes).data]) # subtracting maxes as softmax is shift-invariant
+        s = e * Raw([[1.0 / sum(row)] * len(row) for row in e.data]) # multiply values by the sum of the rows (e^term)/sum(e^terms)
 
         out = Tensor(s, (self,))
         def _backward():
             if self.grad:
                 self.grad += s * (out.grad - (out.grad * s).sum_rows())
                 # strong fusing of the softmax
-        out.backward = _backward
+        out._backward = _backward
         return out
 
+    def T(self):                  
+      out = Tensor(self.data.T(), (self,))
+      def _backward():
+          if self.grad: self.grad += out.grad.T()                                                                
+      out._backward = _backward
+      return out   
 
     def __getitem__(self, idx):
         if not isinstance(idx, tuple): idx = (idx, slice(None))
@@ -202,7 +240,7 @@ class Tensor(Arithmetic):
         for v in reversed(topo):
             v._backward()
 
-# Augmentations are vital for DINOv3
+# Augmentations are vital for DINOv3, but are very customizeable
 GLOBAL_CROP_SIZE              = 24  # DINOv3 uses 224 global out of 256, but we're using MNIST
 LOCAL_CROP_SIZE               = 16  # DINOv3 uses 96 local out of 256
 GLOBAL_CROPS                  = 1   # used 2 global crops
@@ -277,14 +315,11 @@ def get_crops(image):
     local_crops = [crop(augment_image(image, local=True), LOCAL_CROP_SIZE) for _ in range(LOCAL_CROPS)]
     return global_crops, local_crops
 
-
-
 PATCH_SIZE = 4
 N_EMBED = 16
 N_LAYER = 1
 N_HEAD = 4
 HEAD_DIM = N_EMBED // N_HEAD
-
 
 HEAD_PROTOTYPES = 10 # 10 for 10 classes!
 # we simplify the heads to just be linear projections instead of an MLP
@@ -300,6 +335,7 @@ student_state_dict = {
     'local_cls_norm_gamma': Tensor(Raw.vals_like(1, N_EMBED, val=1)),
     'local_cls_norm_beta':  Tensor(Raw.vals_like(1, N_EMBED, val=0)),
 }
+
 for i in range(N_LAYER):
     student_state_dict[f'layer{i}.atten_wq'] = Tensor.random_init(N_EMBED, N_EMBED) # attention weight matrices for each layer
     student_state_dict[f'layer{i}.atten_wk'] = Tensor.random_init(N_EMBED, N_EMBED)
@@ -313,8 +349,45 @@ for i in range(N_LAYER):
     student_state_dict[f'layer{i}.norm2_gamma'] = Tensor(Raw.vals_like(1, N_EMBED, val=1))
     student_state_dict[f'layer{i}.norm2_beta']  = Tensor(Raw.vals_like(1, N_EMBED, val=0))
     # layer-scale skipped because only one layer
+    #student_state_dict[f'layer{i}.ls'] = 
 
-def vit(image, state_dict, train=True):
+def compute_rope(H, W, train=True, r=2, head_dim=HEAD_DIM, base=100.0):
+    periods = [base ** (2*i / (head_dim//2)) for i in range(head_dim//4)]
+    sin_data, cos_data = [], []
+    scale = 1
+    if train:
+        scale = math.exp(random.uniform(-math.log(r), math.log(r)))
+    for r in range(H):
+        for c in range(W):
+            a = [2*math.pi*(2*(r+.5)/H-1)/p * scale for p in periods] + [2*math.pi*(2*(c+.5)/W-1)/p * scale for p in periods]
+            a = a * 2  # tile for rotate_half pairing
+            sin_data.append([math.sin(x) for x in a])
+            cos_data.append([math.cos(x) for x in a])
+    return Raw(sin_data), Raw(cos_data)
+
+def rope_rotate_half(x):
+    h = x.shape()[1] // 2
+    return Tensor.cat(x[:, h:] * -1, x[:, :h], axis=1)
+
+def rope_apply(q, k, sin, cos):
+    q_cls, q_patches = q[0:1], q[1:]
+    k_cls, k_patches = k[0:1], k[1:]
+    q_rot = q_patches * cos + rope_rotate_half(q_patches) * sin
+    k_rot = k_patches * cos + rope_rotate_half(k_patches) * sin
+    return Tensor.cat(q_cls, q_rot), Tensor.cat(k_cls, k_rot)
+
+def layernorm(x, gamma, beta):
+    seq = x.shape()[0]
+    mean = (x.row_sum()) * (1.0 / x.shape()[1])
+    diff = x + mean * -1
+    var = (diff * diff).row_sum() * (1.0 / x.shape()[1])
+    normed = diff * (var + 1e-6) ** -0.5
+    return normed * gamma.repeat_rows(seq) + beta.repeat_rows(seq) # have to repeat rows to match size
+
+def l2_norm(x):
+    return x * (x * x).row_sum() ** -0.5
+
+def vit(image, state_dict, train=True, is_local=False):
     h, w = image.shape()
     H, W = h // PATCH_SIZE, w // PATCH_SIZE
 
@@ -325,18 +398,59 @@ def vit(image, state_dict, train=True):
             x.append(Tensor([sum(patch.data, [])]) @ state_dict['patch_embed'])
             
     x = Tensor.cat(x)
-
-    for layer in range(N_LAYER):
+    sin, cos = compute_rope(H, W, train)
+    for li in range(N_LAYER):
         x_residual = x
+        x = layernorm(x, state_dict[f'layer{li}.norm1_gamma'], state_dict[f'layer{li}.norm1_beta'])
+        
+        # Attention, it's all we need
+        Q = x @ state_dict[f'layer{li}.atten_wq'] # (seq, 16)
+        K = x @ state_dict[f'layer{li}.atten_wk']
+        V = x @ state_dict[f'layer{li}.atten_wv']
 
-print(f'Parameters: {sum(x.shape[0] * x.shape[1] for x in student_state_dict.values())}')
+        heads = []
+        for h in range(N_HEAD):
+            hs = h * HEAD_DIM
+            q_h = Q[:, hs:hs+HEAD_DIM]   # (seq, 4)
+            k_h = K[:, hs:hs+HEAD_DIM]                                                                       
+            v_h = V[:, hs:hs+HEAD_DIM]
+            q_h, k_h = rope_apply(q_h, k_h, sin, cos)    
+            attn = (q_h @ k_h.T()) * (1.0 / HEAD_DIM**0.5)  # (seq, seq)                                     
+            attn = attn.softmax()                                                                            
+            heads.append(attn @ v_h)
 
+        x = Tensor.cat(*heads, axis=1)    # (seq, 16)
+        x = x @ state_dict[f'layer{li}.atten_wo']
+        x = x + x_residual
 
+        x_residual = x
+        x = layernorm(x, state_dict[f'layer{li}.norm2_gamma'], state_dict[f'layer{li}.norm2_beta'])
+        x = (x @ state_dict[f'layer{li}.mlp_w1']).GELU() # (seq, 64)
+        x = x @ state_dict[f'layer{li}.mlp_w2'] # (seq, 16)
+        x = x + x_residual
+
+    if train and is_local:
+        # Sec 3.2: local crops get dedicated norm for CLS, shared norm for patches
+        cls_normed = layernorm(x[0:1], state_dict['local_cls_norm_gamma'], state_dict['local_cls_norm_beta'])
+        patch_normed = layernorm(x[1:], state_dict['norm_gamma'], state_dict['norm_beta'])
+        x = Tensor.cat(cls_normed, patch_normed)
+    else:
+        x = layernorm(x, state_dict['norm_gamma'], state_dict['norm_beta'])
+
+    if train:
+        cls_out = l2_norm(x[0:1] @ state_dict['DINO_head']) # normally would be MLP but skip for simplicity
+        patch_out = l2_norm(x[1:] @ state_dict['iBOT_head'])
+        return cls_out, patch_out
+    else:
+        return x[0:1], x[1:]  # raw CLS and patch embeddings
+print(f'Parameters: {sum(x.shape()[0] * x.shape()[1] for x in student_state_dict.values())}')
+
+teacher_state_dict = copy.deepcopy(student_state_dict) # teacher is initialized from student
 
 # Let there be Adam, the blessed optimizer and its buffers
 learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
-m = [Raw.vals_like(x.shape[0], x.shape[1]) for x in student_state_dict.values*()] # first moment buffer
-v = [Raw.vals_like(x.shape[0], x.shape[1]) for x in student_state_dict.values*()] # second moment buffer
+m = [Raw.vals_like(x.shape()[0], x.shape()[1]) for x in student_state_dict.values()] # first moment buffer
+v = [Raw.vals_like(x.shape()[0], x.shape()[1]) for x in student_state_dict.values()] # second moment buffer
 
 num_steps = 1000
 for step in range(num_steps):
