@@ -26,7 +26,7 @@ def fetch(url):
 
 def parse_images(buf):
     _, n, rows, cols = struct.unpack('>IIII', buf[:16])
-    return [Raw([[b / 255.0 for b in buf[16 + i*rows*cols + r*cols : 16 + i*rows*cols + (r+1)*cols]]
+    return [([[b / 255.0 for b in buf[16 + i*rows*cols + r*cols : 16 + i*rows*cols + (r+1)*cols]]
             for r in range(rows)]) for i in range(n)], rows, cols
 
 def parse_labels(buf):
@@ -268,7 +268,7 @@ class Tensor(Arithmetic):
                 for c in v._children: stack.append((c, False))
         self.grad = Raw.vals_like(*self.data.shape(), val=1)
         for v in reversed(topo):
-            v._backward()
+            if v._backward: v._backward()
 
 # Augmentations are vital for DINOv3, but are very customizeable
 GLOBAL_CROP_SIZE              = 24  # DINOv3 uses 224 global out of 256, but we're using MNIST
@@ -512,11 +512,8 @@ teacher_params = list(teacher_state_dict.values())
 
 print(f'Parameters: {sum(p.shape()[0] * p.shape()[1] for p in student_params)}')
 
-# Let there be Adam, the blessed optimizer and its buffers
+# training hyperparameters
 LEARNING_RATE, BETA1, BETA2, EPS_ADAM = 0.01, 0.85, 0.99, 1e-8
-adam_m = [Raw.vals_like(p.shape()[0], p.shape()[1]) for p in student_params] # first moment
-adam_v = [Raw.vals_like(p.shape()[0], p.shape()[1]) for p in student_params] # second moment
-
 STUDENT_TEMP    = 0.1
 TEACHER_TEMP    = 0.04
 EMA_MOMENTUM    = 0.996
@@ -528,6 +525,12 @@ GRAM_ANCHORING  = True
 GRAM_WEIGHT     = 0.1
 GRAM_START_STEP = 500
 SK_ITERS        = 1 # 3 in DINOv3 but unnecessary compute, 1 approximately works
+NUM_STEPS       = 1000
+BATCH_SIZE      = 4 # needed for KoLeo loss
+
+# adam buffers
+adam_m = [Raw.vals_like(p.shape()[0], p.shape()[1]) for p in student_params] # first moment
+adam_v = [Raw.vals_like(p.shape()[0], p.shape()[1]) for p in student_params] # second moment
 
 def random_mask(num_patches, ratio=MASK_RATIO):
     return [random.random() < ratio for _ in range(num_patches)]
@@ -576,15 +579,12 @@ def log_softmax_tensor(x, temp=STUDENT_TEMP):
     return shifted - shifted.exp().row_sum().log()
 
 
-num_steps = 1000
-BATCH_SIZE = 4 # batch needed for koleo loss
-
-for step in range(num_steps):
+for step in range(NUM_STEPS):
     total_loss = Tensor(Raw([[0.0]]))
     koleo_cls_tokens = []
 
     for b in range(BATCH_SIZE):
-        img = train_images[(step * BATCH_SIZE + b) % len(train_images)]
+        img = Raw(train_images[(step * BATCH_SIZE + b) % len(train_images)])
         global_crops, local_crops = get_crops(img)
 
         # precompute: per-crop masks, teacher outputs, SK probs
@@ -658,14 +658,14 @@ TOP_K  = 5
 embeddings = []
 # embed 500 random train images
 for i in range(KNN_IMAGES):
-    cls, _, _ = vit(train_images[i], student_state_dict, train=False)
+    cls, _, _ = vit(Raw(train_images[i]), student_state_dict, train=False)
     vec = cls.data
     embeddings.append(l2_norm(vec).data[0])
 
 # query 10 random test images, find 5 nearest ones by cosine similarity
 for _ in range(10):
     qi = random.randint(0, len(test_images) - 1)                              
-    cls, _, _ = vit(test_images[qi], student_state_dict, train=False)
+    cls, _, _ = vit(Raw(test_images[qi]), student_state_dict, train=False)
     qv = l2_norm(cls.data).data[0]
     sims = [sum(a*b for a, b in zip(qv, emb)) for emb in embeddings]
     top_k = sorted(range(KNN_IMAGES), key=lambda i: sims[i], reverse=True)[:TOP_K]                                                             
