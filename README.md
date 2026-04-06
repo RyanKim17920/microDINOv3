@@ -8,3 +8,6 @@ DINOv2 Sinkhorn-Knopp requires both a large number of prototypes and batch size 
 Gram anchoring is incorporated as well, but is unused.
 
 All other aspects of DINOv3 are used.
+
+
+output.txt is a sample output, with some large time gaps (I closed the computer at times)
