@@ -1,11 +1,23 @@
+# reference PDFs
 DINOV3.pdf
 DINOV2.pdf
 DINO.pdf
-# just references
-#/dinov3-main
-#basing off real DINOv3
-microgpt.py 
-#basing of karpathy
-*.ipynb 
-#testing purely
+
+# reference repo
+dinov3-main/
+
+# based off karpathy
+microgpt.py
+
+# notebooks / testing
+*.ipynb
+torch_test.py
+
+# python artifacts
+__pycache__/
+
+# logs
+training_log*.txt
+
+# claude code
 .claude

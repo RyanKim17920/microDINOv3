@@ -1,0 +1,95 @@
+N_EMBED=32 N_LAYER=2 N_HEAD=4 HEAD_PROTOTYPES=32 BATCH_SIZE=32 NUM_STEPS=2000 LR=0.001 STUDENT_TEMP=0.1 TEACHER_TEMP=0.07 EMA_MOMENTUM=0.999 MASK_RATIO=0.3 DINO_WEIGHT=1.0 IBOT_WEIGHT=1.0 KOLEO_WEIGHT=0.1 USE_SINKHORN=False CENTER_MOMENTUM=0.9999 GRAM_ANCHORING=False
+train: 60000, test: 10000, size: 28x28
+Parameters: 27616
+step    0 | dino: 6.380  ibot: 3.060  koleo: 0.007  gram: 0.000 | total: 9.447 | 11.7s
+step  100 | dino: 3.747  ibot: 2.238  koleo: 0.014  gram: 0.000 | total: 5.999 | 1378.6s
+step  200 | dino: 3.348  ibot: 2.525  koleo: 0.011  gram: 0.000 | total: 5.884 | 2752.6s
+step  300 | dino: 2.817  ibot: 2.813  koleo: 0.009  gram: 0.000 | total: 5.639 | 4181.1s
+step  400 | dino: 2.438  ibot: 3.126  koleo: 0.009  gram: 0.000 | total: 5.573 | 5543.5s
+step  500 | dino: 2.294  ibot: 3.248  koleo: 0.009  gram: 0.000 | total: 5.551 | 16710.7s
+step  600 | dino: 2.332  ibot: 3.315  koleo: 0.008  gram: 0.000 | total: 5.655 | 60666.8s
+step  700 | dino: 2.004  ibot: 3.339  koleo: 0.008  gram: 0.000 | total: 5.352 | 62061.9s
+step  800 | dino: 1.795  ibot: 3.340  koleo: 0.007  gram: 0.000 | total: 5.143 | 63552.7s
+step  900 | dino: 1.664  ibot: 3.329  koleo: 0.007  gram: 0.000 | total: 5.000 | 65050.6s
+step 1000 | dino: 1.686  ibot: 3.308  koleo: 0.007  gram: 0.000 | total: 5.001 | 66566.5s
+step 1100 | dino: 1.503  ibot: 3.305  koleo: 0.006  gram: 0.000 | total: 4.814 | 67935.4s
+step 1200 | dino: 1.448  ibot: 3.291  koleo: 0.005  gram: 0.000 | total: 4.744 | 69385.3s
+step 1300 | dino: 1.422  ibot: 3.301  koleo: 0.004  gram: 0.000 | total: 4.728 | 70792.2s
+step 1400 | dino: 1.312  ibot: 3.315  koleo: 0.004  gram: 0.000 | total: 4.631 | 72210.4s
+step 1500 | dino: 1.465  ibot: 3.315  koleo: 0.003  gram: 0.000 | total: 4.784 | 73619.9s
+step 1600 | dino: 1.351  ibot: 3.301  koleo: 0.003  gram: 0.000 | total: 4.655 | 75015.1s
+step 1700 | dino: 1.236  ibot: 3.288  koleo: 0.003  gram: 0.000 | total: 4.528 | 76357.7s
+step 1800 | dino: 1.164  ibot: 3.278  koleo: 0.003  gram: 0.000 | total: 4.445 | 77715.1s
+step 1900 | dino: 1.219  ibot: 3.310  koleo: 0.003  gram: 0.000 | total: 4.533 | 79178.6s
+
+--- KNN Evaluation (post-head, 32-dim DINO output) ---
+Embedding 500 train images...
+Evaluating 10000 test images...
+  ... embedded 1000/10000 test images
+  ... embedded 2000/10000 test images
+  ... embedded 3000/10000 test images
+  ... embedded 4000/10000 test images
+  ... embedded 5000/10000 test images
+  ... embedded 6000/10000 test images
+  ... embedded 7000/10000 test images
+  ... embedded 8000/10000 test images
+  ... embedded 9000/10000 test images
+  ... embedded 10000/10000 test images
+  ... evaluated 1000/10000 test images
+  ... evaluated 2000/10000 test images
+  ... evaluated 3000/10000 test images
+  ... evaluated 4000/10000 test images
+  ... evaluated 5000/10000 test images
+  ... evaluated 6000/10000 test images
+  ... evaluated 7000/10000 test images
+  ... evaluated 8000/10000 test images
+  ... evaluated 9000/10000 test images
+  ... evaluated 10000/10000 test images
+Accuracy: 29.2% (2916/10000) [random=10%]
+Examples:
+  [7]: [1, 1, 1, 7, 6]
+  [2]: [2, 2, 3, 8, 6]
+  [1]: [1, 1, 7, 5, 1]
+  [0]: [0, 6, 3, 6, 6]
+  [4]: [9, 1, 7, 4, 7]
+  [1]: [5, 9, 2, 7, 4]
+  [4]: [5, 8, 4, 7, 3]
+  [9]: [7, 7, 5, 4, 9]
+  [5]: [3, 2, 6, 2, 9]
+  [9]: [4, 5, 7, 5, 3]
+
+--- KNN Evaluation (pre-head, 32-dim CLS embedding) ---
+Embedding 500 train images...
+Evaluating 10000 test images...
+  ... embedded 1000/10000 test images
+  ... embedded 2000/10000 test images
+  ... embedded 3000/10000 test images
+  ... embedded 4000/10000 test images
+  ... embedded 5000/10000 test images
+  ... embedded 6000/10000 test images
+  ... embedded 7000/10000 test images
+  ... embedded 8000/10000 test images
+  ... embedded 9000/10000 test images
+  ... embedded 10000/10000 test images
+  ... evaluated 1000/10000 test images
+  ... evaluated 2000/10000 test images
+  ... evaluated 3000/10000 test images
+  ... evaluated 4000/10000 test images
+  ... evaluated 5000/10000 test images
+  ... evaluated 6000/10000 test images
+  ... evaluated 7000/10000 test images
+  ... evaluated 8000/10000 test images
+  ... evaluated 9000/10000 test images
+  ... evaluated 10000/10000 test images
+Accuracy: 35.2% (3524/10000) [random=10%]
+Examples:
+  [7]: [7, 7, 7, 9, 4]
+  [2]: [3, 8, 2, 6, 2]
+  [1]: [1, 1, 1, 1, 1]
+  [0]: [7, 7, 9, 6, 7]
+  [4]: [4, 0, 0, 4, 2]
+  [1]: [1, 1, 1, 2, 1]
+  [4]: [8, 8, 7, 7, 0]
+  [9]: [3, 8, 5, 6, 6]
+  [5]: [0, 8, 5, 2, 5]
+  [9]: [8, 3, 7, 4, 6]

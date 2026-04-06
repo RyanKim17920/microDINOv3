@@ -37,7 +37,6 @@ train_images, rows, cols = parse_images(fetch(f"{MNIST}/train-images-idx3-ubyte.
 train_labels = parse_labels(fetch(f"{MNIST}/train-labels-idx1-ubyte.gz"))
 test_images, _, _  = parse_images(fetch(f"{MNIST}/t10k-images-idx3-ubyte.gz"))
 test_labels  = parse_labels(fetch(f"{MNIST}/t10k-labels-idx1-ubyte.gz"))
-print(f"train: {len(train_images)}, test: {len(test_images)}, size: {rows}x{cols}")
 
 #basic arithmetic operators that work across data and matrices
 class Arithmetic:                                                                                                
@@ -60,6 +59,7 @@ class Raw(Arithmetic):
     def random_init(cls, rows, cols, std=.02): return cls([[random.gauss(0, std) for _ in range(cols)] for _ in range(rows)])
     # shape / info
     def shape(self): return (len(self.data), len(self.data[0]) if self.data else 0)
+    def item(self): return self.data[0][0]
     def flatten(self): return Raw([sum(self.data, [])])
     # element-wise
     def _apply(self, f): return Raw([[f(x) for x in row] for row in self.data])
@@ -135,6 +135,7 @@ class Tensor(Arithmetic):
         return cls(Raw.random_init(rows, cols, std), requires_grad=requires_grad)
 
     def shape(self): return self.data.shape()
+    def item(self): return self.data.item()
 
     # autograd helper — handles simple unary ops where backward = out.grad * local_derivative
     def _unary(self, result, local_grad):
@@ -273,8 +274,8 @@ class Tensor(Arithmetic):
 # Augmentations are vital for DINOv3, but are very customizeable
 GLOBAL_CROP_SIZE              = 24  # DINOv3 uses 224 global out of 256, but we're using MNIST
 LOCAL_CROP_SIZE               = 16  # DINOv3 uses 96 local out of 256
-GLOBAL_CROPS                  = 1   # used 2 global crops
-LOCAL_CROPS                   = 2   # used 8 local crops
+GLOBAL_CROPS                  = 1   # 1 global crop — remove same-crop skip below
+LOCAL_CROPS                   = 2
 
 GLOBAL_BLUR_PROB              = 0.1
 LOCAL_BLUR_PROB               = 0.5
@@ -346,17 +347,17 @@ def get_crops(image):
     return global_crops, local_crops
 
 PATCH_SIZE = 4
-N_EMBED = 16
-N_LAYER = 1
+N_EMBED = 32
+N_LAYER = 2
 N_HEAD = 4
 HEAD_DIM = N_EMBED // N_HEAD
 
 N_REGISTERS = 1
-DROP_PATH_PROB = 0 # set up to 0.3 if multi-layer
+DROP_PATH_PROB = 0.0 # set up to 0.3 if multi-layer
 LAYER_SCALE = False
 
 
-HEAD_PROTOTYPES = 10 # 10 for 10 classes!
+HEAD_PROTOTYPES = 32 # prototypes != classes, more prototypes lets SK produce peaked targets
 # we simplify the heads to just be linear projections instead of an MLP
 student_state_dict = {
     # patch embedding weights, square size to embed dim
@@ -510,27 +511,33 @@ for p in teacher_state_dict.values():
 student_params = list(student_state_dict.values())
 teacher_params = list(teacher_state_dict.values())
 
-print(f'Parameters: {sum(p.shape()[0] * p.shape()[1] for p in student_params)}')
 
 # training hyperparameters
-LEARNING_RATE, BETA1, BETA2, EPS_ADAM = 0.01, 0.85, 0.99, 1e-8
+LEARNING_RATE, BETA1, BETA2, EPS_ADAM = 0.001, 0.9, 0.999, 1e-8
 STUDENT_TEMP    = 0.1
-TEACHER_TEMP    = 0.04
-EMA_MOMENTUM    = 0.996
-MASK_RATIO      = 0.25
+TEACHER_TEMP    = 0.07
+EMA_MOMENTUM    = 0.999
+MASK_RATIO      = 0.3
 DINO_WEIGHT     = 1.0
 IBOT_WEIGHT     = 1.0
 KOLEO_WEIGHT    = 0.1
-GRAM_ANCHORING  = True
+GRAM_ANCHORING  = False
 GRAM_WEIGHT     = 0.1
 GRAM_START_STEP = 500
-SK_ITERS        = 1 # 3 in DINOv3 but unnecessary compute, 1 approximately works
-NUM_STEPS       = 1000
-BATCH_SIZE      = 4 # needed for KoLeo loss
+USE_SINKHORN    = False
+SK_ITERS        = 3
+CENTER_MOMENTUM = 0.9999
+NUM_STEPS       = 2000
+BATCH_SIZE      = 32
 
 # adam buffers
 adam_m = [Raw.vals_like(p.shape()[0], p.shape()[1]) for p in student_params] # first moment
 adam_v = [Raw.vals_like(p.shape()[0], p.shape()[1]) for p in student_params] # second moment
+if not USE_SINKHORN:
+    cls_center = Raw.vals_like(1, HEAD_PROTOTYPES)
+    # DINOv1-style patch center — SK needs large batch (B/K << 1) + many prototypes to work properly,
+    # but is fully functional for large-scale training. At our scale, EMA centering is more stable.
+    ibot_center = Raw.vals_like(1, HEAD_PROTOTYPES)
 
 def random_mask(num_patches, ratio=MASK_RATIO):
     return [random.random() < ratio for _ in range(num_patches)]
@@ -565,8 +572,9 @@ def gram_loss(student_feats, teacher_feats):
     return (diff * diff).sum_all() * (1.0 / (d * d))
 
 def sinkhorn_knopp(logits_raw, iters=SK_ITERS):
-    # converts logits_raw into a doubly-stochastic matrix over iterations, replacing EMA centering 
-    q = logits_raw.exp() if isinstance(logits_raw, Raw) else logits_raw.data.exp()
+    # converts logits_raw into a doubly-stochastic matrix over iterations, replacing EMA centering
+    stabilized = logits_raw - logits_raw.row_max() if isinstance(logits_raw, Raw) else logits_raw.data - logits_raw.data.row_max()
+    q = stabilized.exp()
     for _ in range(iters):
         q /= q.row_sum()   # row-normalize
         q /= q.cols_sum()  # col-normalize
@@ -579,55 +587,115 @@ def log_softmax_tensor(x, temp=STUDENT_TEMP):
     return shifted - shifted.exp().row_sum().log()
 
 
+import time
+
+outf = open('output.txt', 'w')
+header = (f"N_EMBED={N_EMBED} N_LAYER={N_LAYER} N_HEAD={N_HEAD} HEAD_PROTOTYPES={HEAD_PROTOTYPES} "
+          f"BATCH_SIZE={BATCH_SIZE} NUM_STEPS={NUM_STEPS} LR={LEARNING_RATE} STUDENT_TEMP={STUDENT_TEMP} "
+          f"TEACHER_TEMP={TEACHER_TEMP} EMA_MOMENTUM={EMA_MOMENTUM} MASK_RATIO={MASK_RATIO} "
+          f"DINO_WEIGHT={DINO_WEIGHT} IBOT_WEIGHT={IBOT_WEIGHT} KOLEO_WEIGHT={KOLEO_WEIGHT} "
+          f"USE_SINKHORN={USE_SINKHORN} CENTER_MOMENTUM={CENTER_MOMENTUM} GRAM_ANCHORING={GRAM_ANCHORING}")
+outf.write(header + '\n')
+outf.flush()
+
+def log(msg):
+    print(msg, flush=True)
+    outf.write(msg + '\n')
+    outf.flush()
+
+log(f"train: {len(train_images)}, test: {len(test_images)}, size: {rows}x{cols}")
+log(f'Parameters: {sum(p.shape()[0] * p.shape()[1] for p in student_params)}')
+
+t_start = time.time()
+
 for step in range(NUM_STEPS):
     total_loss = Tensor(Raw([[0.0]]))
+    dino_loss_acc, ibot_loss_acc, koleo_loss_acc, gram_loss_acc = 0.0, 0.0, 0.0, 0.0
     koleo_cls_tokens = []
 
+    # phase 1: teacher forward for entire batch, collect outputs
+    batch_data = []
+    n_gp = (GLOBAL_CROP_SIZE // PATCH_SIZE) ** 2
+    all_teacher_cls = []
     for b in range(BATCH_SIZE):
         img = Raw(train_images[(step * BATCH_SIZE + b) % len(train_images)])
         global_crops, local_crops = get_crops(img)
-
-        # precompute: per-crop masks, teacher outputs, SK probs
-        n_gp = (GLOBAL_CROP_SIZE // PATCH_SIZE) ** 2
         masks = [random_mask(n_gp) for _ in global_crops]
         masked_idxs = [[i for i, m in enumerate(mask) if m] for mask in masks]
-
         teacher_outs = [vit(gc, teacher_state_dict, train=True) for gc in global_crops]
-        teacher_dino_probs = [sinkhorn_knopp(t[0].data * (1.0 / TEACHER_TEMP)) for t in teacher_outs]
-        teacher_ibot_probs = [sinkhorn_knopp(Raw([t[1].data.data[i] for i in mi]) * (1.0 / TEACHER_TEMP))
-                              if mi else None for t, mi in zip(teacher_outs, masked_idxs)]
+        for t in teacher_outs:
+            all_teacher_cls.append(t[0].data.data[0])
+        batch_data.append((global_crops, local_crops, masks, masked_idxs, teacher_outs))
+
+    # phase 2: teacher CLS targets
+    teacher_cls_raw = Raw(all_teacher_cls)
+    if USE_SINKHORN:
+        teacher_cls_sk = sinkhorn_knopp(teacher_cls_raw * (1.0 / TEACHER_TEMP))
+    else:
+        centered = teacher_cls_raw - cls_center.repeat_rows(len(all_teacher_cls))
+        teacher_cls_sk = (centered * (1.0 / TEACHER_TEMP)).softmax()
+        batch_mean = Raw([[sum(teacher_cls_raw.data[r][c] for r in range(len(all_teacher_cls))) / len(all_teacher_cls)
+                           for c in range(HEAD_PROTOTYPES)]])
+        cls_center = cls_center * CENTER_MOMENTUM + batch_mean * (1 - CENTER_MOMENTUM)
+
+    # phase 3: student forward + losses
+    for b, (global_crops, local_crops, masks, masked_idxs, teacher_outs) in enumerate(batch_data):
+        teacher_dino_probs = [Raw([teacher_cls_sk.data[b * GLOBAL_CROPS + gi]]) for gi in range(GLOBAL_CROPS)]
+        if USE_SINKHORN:
+            teacher_ibot_probs = [sinkhorn_knopp(Raw([t[1].data.data[i] for i in mi]) * (1.0 / TEACHER_TEMP))
+                                  if mi else None for t, mi in zip(teacher_outs, masked_idxs)]
+        else:
+            # DINOv1-style EMA centering for iBOT patch targets (mirrors cls_center pattern above)
+            # SK needs large batch + many prototypes; at our scale EMA centering is more stable
+            teacher_ibot_probs = []
+            for t, mi in zip(teacher_outs, masked_idxs):
+                if mi:
+                    patch_logits = Raw([t[1].data.data[i] for i in mi])
+                    centered = patch_logits - ibot_center.repeat_rows(len(mi))
+                    teacher_ibot_probs.append((centered * (1.0 / TEACHER_TEMP)).softmax())
+                    # EMA update ibot_center with mean of this crop's masked patch logits
+                    patch_mean = Raw([[sum(patch_logits.data[r][c] for r in range(len(mi))) / len(mi)
+                                       for c in range(HEAD_PROTOTYPES)]])
+                    ibot_center = ibot_center * CENTER_MOMENTUM + patch_mean * (1 - CENTER_MOMENTUM)
+                else:
+                    teacher_ibot_probs.append(None)
         teacher_patch_feats = [t[4].data for t in teacher_outs]
 
-        # student global crops 
         for gi, gc in enumerate(global_crops):
             s_dino, s_ibot, s_cls_pre, s_regs, s_patch_pre = vit(gc, student_state_dict, train=True, mask=masks[gi])
             koleo_cls_tokens.append(s_cls_pre)
 
-            # DINO CLS: student global vs each other teacher global 
             for ti, t_dino_prob in enumerate(teacher_dino_probs):
-                if gi == ti: continue
-                total_loss -= (log_softmax_tensor(s_dino) * t_dino_prob).sum_all() * DINO_WEIGHT
+                if GLOBAL_CROPS >= 2 and gi == ti: continue
+                l = -(log_softmax_tensor(s_dino) * t_dino_prob).sum_all() * DINO_WEIGHT
+                total_loss += l
+                dino_loss_acc += l.item()
 
-            # iBOT: student masked patch head outputs vs teacher masked patch probs
             if masked_idxs[gi] and teacher_ibot_probs[gi] is not None:
                 s_masked = Tensor.cat(*[s_ibot[i:i+1] for i in masked_idxs[gi]])
-                total_loss -= (log_softmax_tensor(s_masked) * teacher_ibot_probs[gi]).sum_all() * (IBOT_WEIGHT / len(masked_idxs[gi]))
+                l = -(log_softmax_tensor(s_masked) * teacher_ibot_probs[gi]).sum_all() * (IBOT_WEIGHT / len(masked_idxs[gi]))
+                total_loss += l
+                ibot_loss_acc += l.item()
 
-            # gram anchoring (pre-head patch features, after warmup)
-            if GRAM_ANCHORING and step >= GRAM_START_STEP:
-                total_loss += gram_loss(s_patch_pre, teacher_patch_feats[gi]) * GRAM_WEIGHT
+            if GRAM_ANCHORING and step >= GRAM_START_STEP and gram_state_dict:
+                gram_feats = vit(gc, gram_state_dict, train=True)[4].data
+                l = gram_loss(s_patch_pre, gram_feats) * GRAM_WEIGHT
+                total_loss += l
+                gram_loss_acc += l.item()
 
-        # student local crops (DINO CLS only)
         for lc in local_crops:
             s_dino_local = vit(lc, student_state_dict, train=True, is_local=True)[0]
             for t_dino_prob in teacher_dino_probs:
-                total_loss -= (log_softmax_tensor(s_dino_local) * t_dino_prob).sum_all() * DINO_WEIGHT
+                l = -(log_softmax_tensor(s_dino_local) * t_dino_prob).sum_all() * DINO_WEIGHT
+                total_loss += l
+                dino_loss_acc += l.item()
 
-    # KoLeo across all student global CLS tokens in batch
     if len(koleo_cls_tokens) >= 2:
-        total_loss += koleo_loss(koleo_cls_tokens) * KOLEO_WEIGHT
+        l = koleo_loss(koleo_cls_tokens) * KOLEO_WEIGHT
+        total_loss += l
+        koleo_loss_acc = l.item()
 
-    total_loss /= BATCH_SIZE # backward the loss
+    total_loss /= BATCH_SIZE
 
     total_loss.backward()
 
@@ -639,34 +707,91 @@ for step in range(NUM_STEPS):
         adam_v[i] = adam_v[i] * BETA2 + (sp.grad * sp.grad) * (1 - BETA2)
         m_hat = adam_m[i] * (1.0 / bc1)
         v_hat = adam_v[i] * (1.0 / bc2)
-        # convert to raw to get rid of backprop
         sp.data -= LEARNING_RATE * m_hat / (v_hat ** 0.5 + EPS_ADAM)
         tp.data = tp.data * EMA_MOMENTUM + sp.data * (1 - EMA_MOMENTUM)
         sp.grad = Raw.vals_like(*sp.shape())
 
-    # snapshot gram anchor teacher at warmup boundary (DINOv3 had specific point and updated over iters but too complex for this)
+    # snapshot gram anchor teacher at warmup boundary
     if GRAM_ANCHORING and step == GRAM_START_STEP:
         gram_state_dict = copy.deepcopy(teacher_state_dict)
 
-    if step % 50 == 0:
-        print(f"step {step}, loss: {total_loss.data.data[0][0]:.4f}")
+    if step % 100 == 0:
+        elapsed = time.time() - t_start
+        log(f"step {step:4d} | dino: {dino_loss_acc/BATCH_SIZE:.3f}  ibot: {ibot_loss_acc/BATCH_SIZE:.3f}  koleo: {koleo_loss_acc/BATCH_SIZE:.3f}  gram: {gram_loss_acc/BATCH_SIZE:.3f} | total: {total_loss.item():.3f} | {elapsed:.1f}s")
 
-print("\n--- KNN Evaluation ---")
 KNN_IMAGES = 500
-TOP_K  = 5
+TOP_K = 5
 
-embeddings = []
-# embed 500 random train images
+def knn_evaluate(embeddings, embed_labels, test_imgs, test_lbls, top_k=TOP_K):
+    """Evaluate kNN accuracy over all test images. Returns (correct, total, example_predictions)."""
+    total = len(test_imgs)
+    correct = 0
+    examples = []  # collect first 10 for visual inspection
+    for qi in range(total):
+        qv = test_imgs[qi]
+        # cosine similarity against all train embeddings
+        sims = [sum(a * b for a, b in zip(qv, emb)) for emb in embeddings]
+        top_k_idxs = sorted(range(len(embeddings)), key=lambda i: sims[i], reverse=True)[:top_k]
+        neighbor_labels = [embed_labels[i] for i in top_k_idxs]
+        # majority vote
+        votes = {}
+        for lbl in neighbor_labels:
+            votes[lbl] = votes.get(lbl, 0) + 1
+        predicted = max(votes, key=votes.get)
+        if predicted == test_lbls[qi]:
+            correct += 1
+        if len(examples) < 10:
+            examples.append((test_lbls[qi], neighbor_labels))
+        if (qi + 1) % 1000 == 0:
+            log(f"  ... evaluated {qi + 1}/{total} test images")
+    return correct, total, examples
+
+# --- Post-head evaluation (DINO head output) ---
+log(f"\n--- KNN Evaluation (post-head, {HEAD_PROTOTYPES}-dim DINO output) ---")
+log(f"Embedding {KNN_IMAGES} train images...")
+embeddings_post = []
+embed_labels_post = []
+for i in range(KNN_IMAGES):
+    dino_out = vit(Raw(train_images[i]), student_state_dict, train=True)[0]  # post-head (1, HEAD_PROTOTYPES)
+    embeddings_post.append(l2_norm(dino_out.data).data[0])
+    embed_labels_post.append(train_labels[i])
+
+log(f"Evaluating {len(test_images)} test images...")
+# pre-compute all test embeddings (post-head)
+test_embeds_post = []
+for qi in range(len(test_images)):
+    dino_out = vit(Raw(test_images[qi]), student_state_dict, train=True)[0]
+    test_embeds_post.append(l2_norm(dino_out.data).data[0])
+    if (qi + 1) % 1000 == 0:
+        log(f"  ... embedded {qi + 1}/{len(test_images)} test images")
+
+correct, total, examples = knn_evaluate(embeddings_post, embed_labels_post, test_embeds_post, test_labels, TOP_K)
+log(f"Accuracy: {correct / total * 100:.1f}% ({correct}/{total}) [random=10%]")
+log("Examples:")
+for true_label, neighbor_labels in examples:
+    log(f"  [{true_label}]: {neighbor_labels}")
+
+# --- Pre-head evaluation (raw CLS embedding) ---
+log(f"\n--- KNN Evaluation (pre-head, {N_EMBED}-dim CLS embedding) ---")
+log(f"Embedding {KNN_IMAGES} train images...")
+embeddings_pre = []
+embed_labels_pre = []
 for i in range(KNN_IMAGES):
     cls, _, _ = vit(Raw(train_images[i]), student_state_dict, train=False)
-    vec = cls.data
-    embeddings.append(l2_norm(vec).data[0])
+    embeddings_pre.append(l2_norm(cls.data).data[0])
+    embed_labels_pre.append(train_labels[i])
 
-# query 10 random test images, find 5 nearest ones by cosine similarity
-for _ in range(10):
-    qi = random.randint(0, len(test_images) - 1)                              
+log(f"Evaluating {len(test_images)} test images...")
+# pre-compute all test embeddings (pre-head)
+test_embeds_pre = []
+for qi in range(len(test_images)):
     cls, _, _ = vit(Raw(test_images[qi]), student_state_dict, train=False)
-    qv = l2_norm(cls.data).data[0]
-    sims = [sum(a*b for a, b in zip(qv, emb)) for emb in embeddings]
-    top_k = sorted(range(KNN_IMAGES), key=lambda i: sims[i], reverse=True)[:TOP_K]                                                             
-    print(f"  [{test_labels[qi]}]: {[train_labels[i] for i in top_k]}")  
+    test_embeds_pre.append(l2_norm(cls.data).data[0])
+    if (qi + 1) % 1000 == 0:
+        log(f"  ... embedded {qi + 1}/{len(test_images)} test images")
+
+correct, total, examples = knn_evaluate(embeddings_pre, embed_labels_pre, test_embeds_pre, test_labels, TOP_K)
+log(f"Accuracy: {correct / total * 100:.1f}% ({correct}/{total}) [random=10%]")
+log("Examples:")
+for true_label, neighbor_labels in examples:
+    log(f"  [{true_label}]: {neighbor_labels}")
