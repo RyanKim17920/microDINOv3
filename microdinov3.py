@@ -1,8 +1,8 @@
 """
-The almost-fully atomic way to train and run inference for DINOv3 in pure, dependency-free Python.
-Inspired by Karpathy's microGPT.py
+DINOv3 in pure, dependency-free Python. No torch, no numpy — just stdlib.
 This file is the complete algorithm.
-Efficiency is applied for further educational value and runnable speed (improved autograd with matrixes, fused modules)
+Inspired by Karpathy's microGPT.
+Autograd operates on matrices (not scalars) and modules are fused — the only concessions to runnable speed.
 """
 
 import os
