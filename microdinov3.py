@@ -596,22 +596,33 @@ def koleo_loss(cls_tensors):
     return loss * (1.0 / B)
 
 def gram_loss(student_feats, teacher_feats):
-    # gram loss: ||G_student - G_teacher||^2 where G = X^T @ X / n
-    # for anchoring feature correlations
-    n, d = student_feats.shape()
-    s_gram = student_feats.T() @ student_feats * (1.0 / n)
-    t_gram = teacher_feats.T() @ teacher_feats * (1.0 / n)
-    diff = s_gram - t_gram
-    return (diff * diff).sum_all() * (1.0 / (d * d))
+    # Gram anchoring (paper Eq. 2): L_Gram = || X_S X_S^T - X_G X_G^T ||_F^2, where X is the matrix of
+    # *L2-normalized* patch features. So the anchored quantity is the N x N matrix of pairwise patch
+    # cosine similarities -- the structure of patch-to-patch relationships -- not the d x d feature
+    # covariance. Individual features stay free to move; only their relative geometry is pinned to the
+    # Gram teacher. That is what preserves patch locality over long training runs.
+    # Reduction is a mean over the N x N entries, matching torch MSELoss in dinov3/loss/gram_loss.py.
+    n, _ = student_feats.shape()
+    s = l2_norm(student_feats)
+    t = l2_norm(teacher_feats)
+    diff = (s @ s.T()) - (t @ t.T())
+    return (diff * diff).sum_all() * (1.0 / (n * n))
 
-def sinkhorn_knopp(logits_raw, iters=SK_ITERS):
-    # converts logits_raw into a doubly-stochastic matrix over iterations, replacing EMA centering
-    stabilized = logits_raw - logits_raw.row_max() if isinstance(logits_raw, Raw) else logits_raw.data - logits_raw.data.row_max()
-    q = stabilized.exp()
+def sinkhorn_knopp(logits_raw, temp=TEACHER_TEMP, iters=SK_ITERS):
+    # Sinkhorn-Knopp teacher targets, following dinov3/loss/dino_clstoken_loss.py.
+    # Takes (B, K) logits, returns (B, K) assignments whose ROWS sum to 1.
+    # Internally Q is K-by-B, matching the paper's notation. The previous implementation ended on a
+    # column normalization, so its rows summed to K/B rather than 1 -- correct only by accident when
+    # the matrix happened to be square, and wrong for the masked-patch case where B varies per crop.
+    scaled = logits_raw * (1.0 / temp)
+    gmax = max(max(row) for row in scaled.data)  # global shift: cancels exactly in the sum_Q normalization
+    Q = (scaled + (-gmax)).exp().T()             # (K, B)
+    K, B = Q.shape()
+    Q = Q * (1.0 / (Q.sum_all() + 1e-12))
     for _ in range(iters):
-        q /= q.row_sum()   # row-normalize
-        q /= q.cols_sum()  # col-normalize
-    return q
+        Q = Q * ((Q.row_sum() + 1e-12) ** -1) * (1.0 / K)   # each prototype takes total weight 1/K
+        Q = Q * ((Q.cols_sum() + 1e-12) ** -1) * (1.0 / B)  # each sample takes total weight 1/B
+    return (Q * B).T()  # undo the final /B so every sample's row sums to 1
 
 def log_softmax_tensor(x, temp=STUDENT_TEMP):
     # for numerical stability, log_softmax: x/temp - max - log(sum(exp(x/temp - max)))
@@ -663,7 +674,7 @@ for step in range(NUM_STEPS):
     # phase 2: teacher CLS targets
     teacher_cls_raw = Raw(all_teacher_cls)
     if USE_SINKHORN:
-        teacher_cls_sk = sinkhorn_knopp(teacher_cls_raw * (1.0 / TEACHER_TEMP))
+        teacher_cls_sk = sinkhorn_knopp(teacher_cls_raw)
     else:
         centered = teacher_cls_raw - cls_center.repeat_rows(len(all_teacher_cls))
         teacher_cls_sk = (centered * (1.0 / TEACHER_TEMP)).softmax()
@@ -675,11 +686,10 @@ for step in range(NUM_STEPS):
     for b, (global_crops, local_crops, masks, masked_idxs, teacher_outs) in enumerate(batch_data):
         teacher_dino_probs = [Raw([teacher_cls_sk.data[b * GLOBAL_CROPS + gi]]) for gi in range(GLOBAL_CROPS)]
         if USE_SINKHORN:
-            teacher_ibot_probs = [sinkhorn_knopp(Raw([t[1].data.data[i] for i in mi]) * (1.0 / TEACHER_TEMP))
+            teacher_ibot_probs = [sinkhorn_knopp(Raw([t[1].data.data[i] for i in mi]))
                                   if mi else None for t, mi in zip(teacher_outs, masked_idxs)]
         else:
             # DINOv1-style EMA centering for iBOT patch targets (mirrors cls_center pattern above)
-            # SK needs large batch + many prototypes; at our scale EMA centering is more stable
             teacher_ibot_probs = []
             for t, mi in zip(teacher_outs, masked_idxs):
                 if mi:
