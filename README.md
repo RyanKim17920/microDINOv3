@@ -1,4 +1,4 @@
-# nanoDINOv3
+# microDINOv3
 
 DINOv3 reimplemented in ~800 lines of pure, dependency-free Python.
 No torch, no numpy — just stdlib. Inspired by Karpathy's microGPT.
