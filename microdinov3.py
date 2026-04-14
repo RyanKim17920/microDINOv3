@@ -358,18 +358,30 @@ LAYER_SCALE = False
 
 
 HEAD_PROTOTYPES = 32 # prototypes != classes, more prototypes lets SK produce peaked targets
-# we simplify the heads to just be linear projections instead of an MLP
+HEAD_HIDDEN     = 64 # head MLP hidden width (paper: 8192)
+HEAD_BOTTLENECK = 16 # head MLP output width, L2-normalized before the prototype layer (paper: 512 DINO / 384 iBOT)
+# Head shape follows the real one: MLP(in -> hidden -> bottleneck) -> L2norm -> Linear(bottleneck -> K, no bias).
+# The L2 norm sits on the BOTTLENECK, not on the output logits: normalizing the K-dim logit vector would cap every
+# logit at ~1/sqrt(K) and make it impossible for the student to produce a peaked distribution at temperature 0.1.
 student_state_dict = {
     # patch embedding weights, square size to embed dim
-    'patch_embed': Tensor.random_init(PATCH_SIZE * PATCH_SIZE, N_EMBED), 
+    'patch_embed': Tensor.random_init(PATCH_SIZE * PATCH_SIZE, N_EMBED),
     # technically could have std = uniform(-1/patch_size, 1/patch_size) but things break down when small scale so keeping =.02
     # learnable tokens
     'CLS_token': Tensor(Raw.random_init(1, N_EMBED)),         # learned CLS token
     'register_tokens':Tensor(Raw.random_init(N_REGISTERS, N_EMBED)), # register
     'mask_token': Tensor(Raw.vals_like(1, N_EMBED, val=0)), # for iBOT
-    # projection heads
-    'DINO_head': Tensor.random_init(N_EMBED, HEAD_PROTOTYPES),          # projects CLS embed to prototype dim for DINO loss
-    'iBOT_head': Tensor.random_init(N_EMBED, HEAD_PROTOTYPES),          # projects patch embeds to prototype dim for iBOT loss
+    # projection heads (untied: DINO and iBOT get separate weights, as in the paper)
+    # The prototype layer is initialized so each prototype vector has ~unit norm, making the logits
+    # genuine cosine similarities in [-1, 1]. The paper's std=0.02 gives norm 0.02*sqrt(512)~0.45 at
+    # their 512-d bottleneck; the same std at a 16-d bottleneck gives 0.08, which pins the softmax to
+    # uniform at temperature 0.1 no matter what the backbone does.
+    'DINO_mlp1': Tensor.random_init(N_EMBED, HEAD_HIDDEN),
+    'DINO_mlp2': Tensor.random_init(HEAD_HIDDEN, HEAD_BOTTLENECK),
+    'DINO_last': Tensor.random_init(HEAD_BOTTLENECK, HEAD_PROTOTYPES, std=HEAD_BOTTLENECK ** -0.5),
+    'iBOT_mlp1': Tensor.random_init(N_EMBED, HEAD_HIDDEN),
+    'iBOT_mlp2': Tensor.random_init(HEAD_HIDDEN, HEAD_BOTTLENECK),
+    'iBOT_last': Tensor.random_init(HEAD_BOTTLENECK, HEAD_PROTOTYPES, std=HEAD_BOTTLENECK ** -0.5),
     # backbone output norm (shared: applied to everything for global crops, patches-only for local crops)
     'norm_gamma': Tensor(Raw.vals_like(1, N_EMBED, val=1)),
     'norm_beta':  Tensor(Raw.vals_like(1, N_EMBED, val=0)),
@@ -431,7 +443,18 @@ def layernorm(x, gamma, beta):
 def l2_norm(x):
     return x * ((x * x ).row_sum() + 1e-6) ** -0.5
 
-def vit(image, state_dict, train=True, is_local=False, mask=None):
+def projection_head(x, state_dict, prefix):
+    # MLP -> L2 normalize the bottleneck -> linear to prototypes (no bias).
+    h = (x @ state_dict[f'{prefix}_mlp1']).GELU()
+    bottleneck = l2_norm(h @ state_dict[f'{prefix}_mlp2'])
+    return bottleneck @ state_dict[f'{prefix}_last']
+
+def vit(image, state_dict, train=True, is_local=False, mask=None, apply_head=None):
+    # `train` controls training-only behaviour (RoPE box jitter, the dedicated local-crop CLS norm).
+    # `apply_head` controls whether the projection heads run, and defaults to `train` for backwards
+    # compatibility. They are separate so evaluation can read head outputs without enabling jitter.
+    if apply_head is None:
+        apply_head = train
     h, w = image.shape()
     H, W = h // PATCH_SIZE, w // PATCH_SIZE
 
@@ -494,17 +517,21 @@ def vit(image, state_dict, train=True, is_local=False, mask=None):
         x = Tensor.cat(cls_normed, patch_normed)
     else:
         x = layernorm(x, state_dict['norm_gamma'], state_dict['norm_beta'])
-    if train:
-        # real DINOv3 head: MLP(in→2048→256) → L2norm → Linear(256→K, no bias), L2 between MLP and final layer
-        # makes it cosine similarity to learned prototypes. we skip the MLP, MNIST doesn't need that capacity
-        cls_out = l2_norm(x[0:1] @ state_dict['DINO_head'])
-        patch_out = l2_norm(x[pre_token_count:] @ state_dict['iBOT_head'])
-        return cls_out, patch_out, x[0:1], x[1:pre_token_count], x[pre_token_count:] # DINO, iBot, then normal CLS, registers, patch embeddingss
-    else:
-        return x[0:1], x[1:pre_token_count], x[pre_token_count:]  # raw CLS, registers, and patch embeddings
+    # DINO head out, iBOT head out, raw CLS, registers, patch embeddings.
+    # Head outputs are None when apply_head is False; the shape of the tuple never changes.
+    cls_out   = projection_head(x[0:1], state_dict, 'DINO') if apply_head else None
+    patch_out = projection_head(x[pre_token_count:], state_dict, 'iBOT') if apply_head else None
+    return cls_out, patch_out, x[0:1], x[1:pre_token_count], x[pre_token_count:]
 
 teacher_state_dict = copy.deepcopy(student_state_dict) # teacher is initialized from student
 for p in teacher_state_dict.values():
+    p.requires_grad = False
+    p.grad = None
+
+# kept untouched for the whole run so evaluation can report a random-init control against the exact
+# weights this run started from. chance (10%) is not a meaningful baseline for a representation probe.
+init_state_dict = copy.deepcopy(student_state_dict)
+for p in init_state_dict.values():
     p.requires_grad = False
     p.grad = None
 
@@ -512,8 +539,14 @@ student_params = list(student_state_dict.values())
 teacher_params = list(teacher_state_dict.values())
 
 
-# training hyperparameters
-LEARNING_RATE, BETA1, BETA2, EPS_ADAM = 0.001, 0.9, 0.999, 1e-8
+# training hyperparameters. env overrides exist so a short smoke run can be launched without editing the file.
+def _envf(name, default): return float(os.environ.get(name, default))
+def _envi(name, default): return int(os.environ.get(name, default))
+
+LEARNING_RATE, BETA1, BETA2, EPS_ADAM = _envf('LR', 0.001), 0.9, 0.999, 1e-8
+WEIGHT_DECAY    = _envf('WEIGHT_DECAY', 0.04)  # AdamW, decoupled, matrices only (paper: constant 0.04)
+WARMUP_STEPS    = _envi('WARMUP_STEPS', 100)   # linear LR warmup (paper: 100k iters of a 1M-iter run)
+CLIP_GRAD       = _envf('CLIP_GRAD', 30.0)     # global grad-norm clip (paper: 30.0)
 STUDENT_TEMP    = 0.1
 TEACHER_TEMP    = 0.07
 EMA_MOMENTUM    = 0.999
@@ -777,7 +810,7 @@ log(f"Embedding {KNN_IMAGES} train images...")
 embeddings_pre = []
 embed_labels_pre = []
 for i in range(KNN_IMAGES):
-    cls, _, _ = vit(Raw(train_images[i]), student_state_dict, train=False)
+    cls = vit(Raw(train_images[i]), student_state_dict, train=False)[2]
     embeddings_pre.append(l2_norm(cls.data).data[0])
     embed_labels_pre.append(train_labels[i])
 
@@ -785,7 +818,7 @@ log(f"Evaluating {len(test_images)} test images...")
 # pre-compute all test embeddings (pre-head)
 test_embeds_pre = []
 for qi in range(len(test_images)):
-    cls, _, _ = vit(Raw(test_images[qi]), student_state_dict, train=False)
+    cls = vit(Raw(test_images[qi]), student_state_dict, train=False)[2]
     test_embeds_pre.append(l2_norm(cls.data).data[0])
     if (qi + 1) % 1000 == 0:
         log(f"  ... embedded {qi + 1}/{len(test_images)} test images")
