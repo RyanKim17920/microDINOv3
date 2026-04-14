@@ -274,8 +274,8 @@ class Tensor(Arithmetic):
 # Augmentations are vital for DINOv3, but are very customizeable
 GLOBAL_CROP_SIZE              = 24  # DINOv3 uses 224 global out of 256, but we're using MNIST
 LOCAL_CROP_SIZE               = 16  # DINOv3 uses 96 local out of 256
-GLOBAL_CROPS                  = 1   # 1 global crop — remove same-crop skip below
-LOCAL_CROPS                   = 2
+GLOBAL_CROPS                  = 2   # 2 global crops, so the DINO global term is a genuine cross-view pair
+LOCAL_CROPS                   = 2   # DINOv3 uses 8
 
 GLOBAL_BLUR_PROB              = 0.1
 LOCAL_BLUR_PROB               = 0.5
@@ -554,22 +554,34 @@ MASK_RATIO      = 0.3
 DINO_WEIGHT     = 1.0
 IBOT_WEIGHT     = 1.0
 KOLEO_WEIGHT    = 0.1
-GRAM_ANCHORING  = False
-GRAM_WEIGHT     = 0.1
-GRAM_START_STEP = 500
-USE_SINKHORN    = False
+GRAM_ANCHORING  = os.environ.get('GRAM_ANCHORING', '1') == '1'
+GRAM_WEIGHT     = _envf('GRAM_WEIGHT', 2.0)    # paper appendix C: w_Gram = 2
+GRAM_START_STEP = _envi('GRAM_START_STEP', 500)
+GRAM_REFRESH    = _envi('GRAM_REFRESH', 500)   # refresh the Gram teacher every N steps (paper: every 10k iters)
+GRAM_MAX_UPDATES= _envi('GRAM_MAX_UPDATES', 3) # paper: at most 3 refreshes
+USE_SINKHORN    = os.environ.get('USE_SINKHORN', '0') == '1'
 SK_ITERS        = 3
-CENTER_MOMENTUM = 0.9999
-NUM_STEPS       = 2000
-BATCH_SIZE      = 32
+CENTER_MOMENTUM = _envf('CENTER_MOMENTUM', 0.9)  # paper/DINOv2 use 0.9; 0.9999 left the center inert over 2k steps
+NUM_STEPS       = _envi('NUM_STEPS', 2000)
+BATCH_SIZE      = _envi('BATCH_SIZE', 32)
+LOG_EVERY       = _envi('LOG_EVERY', 100)
+
+# DINO multi-crop loss scaling, following ssl_meta_arch.py: each group is averaged over its
+# (student crop x teacher crop) pairs, then weighted by that group's share of the total pair count.
+DINO_GLOBAL_TERMS = GLOBAL_CROPS * (GLOBAL_CROPS - 1)  # same-crop pairs are skipped
+DINO_LOCAL_TERMS  = GLOBAL_CROPS * LOCAL_CROPS
+DINO_GLOBAL_SCALE = DINO_GLOBAL_TERMS / (DINO_GLOBAL_TERMS + DINO_LOCAL_TERMS) if DINO_GLOBAL_TERMS else 0.0
+DINO_LOCAL_SCALE  = DINO_LOCAL_TERMS / (DINO_GLOBAL_TERMS + DINO_LOCAL_TERMS)
+KOLEO_SCALE       = GLOBAL_CROPS
 
 # adam buffers
 adam_m = [Raw.vals_like(p.shape()[0], p.shape()[1]) for p in student_params] # first moment
 adam_v = [Raw.vals_like(p.shape()[0], p.shape()[1]) for p in student_params] # second moment
 if not USE_SINKHORN:
     cls_center = Raw.vals_like(1, HEAD_PROTOTYPES)
-    # DINOv1-style patch center — SK needs large batch (B/K << 1) + many prototypes to work properly,
-    # but is fully functional for large-scale training. At our scale, EMA centering is more stable.
+    # DINOv1-style EMA centering. DINOv3 uses Sinkhorn-Knopp for both heads (ssl_meta_arch.py asserts it);
+    # SK is implemented and correct here, but wants a large batch and many prototypes to stay away from the
+    # uniform solution, so EMA centering remains the default at this scale. Set USE_SINKHORN=1 to switch.
     ibot_center = Raw.vals_like(1, HEAD_PROTOTYPES)
 
 def random_mask(num_patches, ratio=MASK_RATIO):
@@ -652,10 +664,27 @@ log(f'Parameters: {sum(p.shape()[0] * p.shape()[1] for p in student_params)}')
 
 t_start = time.time()
 
+# Gram teacher: a frozen snapshot of the EMA teacher, taken once dense features are healthy and then
+# refreshed a bounded number of times. It must exist BEFORE the loss that reads it, so the snapshot is
+# taken at the top of the step rather than after the optimizer.
+gram_state_dict = None
+gram_updates = 0
+
+# names that should not get weight decay: norms, learned tokens (torch excludes 1-d params likewise)
+NO_DECAY = tuple(k for k in student_state_dict if 'norm' in k or 'token' in k or k.endswith('ls1') or k.endswith('ls2'))
+no_decay_flags = [k in NO_DECAY for k in student_state_dict]
+
 for step in range(NUM_STEPS):
+    # refresh the Gram teacher at the start of the step, so it is always defined when the loss reads it
+    if GRAM_ANCHORING and step >= GRAM_START_STEP:
+        due = (gram_state_dict is None) or (GRAM_REFRESH > 0 and (step - GRAM_START_STEP) % GRAM_REFRESH == 0)
+        if due and gram_updates <= GRAM_MAX_UPDATES:
+            gram_state_dict = copy.deepcopy(teacher_state_dict)
+            gram_updates += 1
+
     total_loss = Tensor(Raw([[0.0]]))
     dino_loss_acc, ibot_loss_acc, koleo_loss_acc, gram_loss_acc = 0.0, 0.0, 0.0, 0.0
-    koleo_cls_tokens = []
+    koleo_cls_by_crop = [[] for _ in range(GLOBAL_CROPS)]
 
     # phase 1: teacher forward for entire batch, collect outputs
     batch_data = []
@@ -666,7 +695,8 @@ for step in range(NUM_STEPS):
         global_crops, local_crops = get_crops(img)
         masks = [random_mask(n_gp) for _ in global_crops]
         masked_idxs = [[i for i, m in enumerate(mask) if m] for mask in masks]
-        teacher_outs = [vit(gc, teacher_state_dict, train=True) for gc in global_crops]
+        # teacher runs in eval mode: no RoPE box jitter, matching the official teacher being .eval()
+        teacher_outs = [vit(gc, teacher_state_dict, train=False, apply_head=True) for gc in global_crops]
         for t in teacher_outs:
             all_teacher_cls.append(t[0].data.data[0])
         batch_data.append((global_crops, local_crops, masks, masked_idxs, teacher_outs))
@@ -702,68 +732,99 @@ for step in range(NUM_STEPS):
                     ibot_center = ibot_center * CENTER_MOMENTUM + patch_mean * (1 - CENTER_MOMENTUM)
                 else:
                     teacher_ibot_probs.append(None)
-        teacher_patch_feats = [t[4].data for t in teacher_outs]
+
+        # DINO terms are averaged within their group, then weighted by the group's share of all pairs
+        dino_global_sum, dino_local_sum = Tensor(Raw([[0.0]])), Tensor(Raw([[0.0]]))
 
         for gi, gc in enumerate(global_crops):
             s_dino, s_ibot, s_cls_pre, s_regs, s_patch_pre = vit(gc, student_state_dict, train=True, mask=masks[gi])
-            koleo_cls_tokens.append(s_cls_pre)
+            koleo_cls_by_crop[gi].append(s_cls_pre)
 
             for ti, t_dino_prob in enumerate(teacher_dino_probs):
-                if GLOBAL_CROPS >= 2 and gi == ti: continue
-                l = -(log_softmax_tensor(s_dino) * t_dino_prob).sum_all() * DINO_WEIGHT
-                total_loss += l
+                if gi == ti: continue  # same crop: skip, otherwise this is student(x) -> teacher(x) self-prediction
+                l = -(log_softmax_tensor(s_dino) * t_dino_prob).sum_all()
+                dino_global_sum += l
                 dino_loss_acc += l.item()
 
             if masked_idxs[gi] and teacher_ibot_probs[gi] is not None:
                 s_masked = Tensor.cat(*[s_ibot[i:i+1] for i in masked_idxs[gi]])
-                l = -(log_softmax_tensor(s_masked) * teacher_ibot_probs[gi]).sum_all() * (IBOT_WEIGHT / len(masked_idxs[gi]))
-                total_loss += l
+                l = -(log_softmax_tensor(s_masked) * teacher_ibot_probs[gi]).sum_all() * (1.0 / len(masked_idxs[gi]))
+                total_loss += l * IBOT_WEIGHT
                 ibot_loss_acc += l.item()
 
-            if GRAM_ANCHORING and step >= GRAM_START_STEP and gram_state_dict:
-                gram_feats = vit(gc, gram_state_dict, train=True)[4].data
-                l = gram_loss(s_patch_pre, gram_feats) * GRAM_WEIGHT
-                total_loss += l
+            if gram_state_dict is not None:
+                # Gram teacher features are constants: read .data so no gradient flows into the snapshot
+                gram_feats = vit(gc, gram_state_dict, train=False, apply_head=False)[4].data
+                l = gram_loss(s_patch_pre, gram_feats)
+                total_loss += l * GRAM_WEIGHT
                 gram_loss_acc += l.item()
 
         for lc in local_crops:
             s_dino_local = vit(lc, student_state_dict, train=True, is_local=True)[0]
             for t_dino_prob in teacher_dino_probs:
-                l = -(log_softmax_tensor(s_dino_local) * t_dino_prob).sum_all() * DINO_WEIGHT
-                total_loss += l
+                l = -(log_softmax_tensor(s_dino_local) * t_dino_prob).sum_all()
+                dino_local_sum += l
                 dino_loss_acc += l.item()
 
-    if len(koleo_cls_tokens) >= 2:
-        l = koleo_loss(koleo_cls_tokens) * KOLEO_WEIGHT
-        total_loss += l
-        koleo_loss_acc = l.item()
+        if DINO_GLOBAL_TERMS:
+            total_loss += dino_global_sum * (DINO_WEIGHT * DINO_GLOBAL_SCALE / DINO_GLOBAL_TERMS)
+        total_loss += dino_local_sum * (DINO_WEIGHT * DINO_LOCAL_SCALE / DINO_LOCAL_TERMS)
 
+    # per-image losses accumulated above are averaged over the batch
     total_loss /= BATCH_SIZE
+
+    # KoLeo is already a batch-level quantity (it ranks CLS tokens *against each other* across the batch),
+    # so it is added after the batch average rather than before -- adding it before divided it by BATCH_SIZE
+    # a second time and left it ~32x under-weighted. Per ssl_meta_arch.py it is averaged over global crops
+    # and then scaled by the number of global crops.
+    koleo_terms = [koleo_loss(toks) for toks in koleo_cls_by_crop if len(toks) >= 2]
+    if koleo_terms:
+        kl = Tensor(Raw([[0.0]]))
+        for t in koleo_terms: kl += t
+        kl = kl * (KOLEO_WEIGHT * KOLEO_SCALE / len(koleo_terms))
+        total_loss += kl
+        koleo_loss_acc = kl.item()
 
     total_loss.backward()
 
-    # adam + ema teacher + zero grad
+    # global grad-norm clipping
+    sq = sum(sum(v * v for v in row) for p in student_params if p.grad for row in p.grad.data)
+    gnorm = sq ** 0.5
+    clip_scale = min(1.0, CLIP_GRAD / (gnorm + 1e-6))
+
+    # linear LR warmup, then constant (DINOv3 keeps LR/wd/momentum constant after warmup)
+    lr = LEARNING_RATE * min(1.0, (step + 1) / WARMUP_STEPS) if WARMUP_STEPS > 0 else LEARNING_RATE
+
+    # adamw + ema teacher + zero grad
     bc1, bc2 = 1 - BETA1 ** (step + 1), 1 - BETA2 ** (step + 1)
     for i, (sp, tp) in enumerate(zip(student_params, teacher_params)):
         if sp.grad is None: continue
-        adam_m[i] = adam_m[i] * BETA1 + sp.grad * (1 - BETA1)
-        adam_v[i] = adam_v[i] * BETA2 + (sp.grad * sp.grad) * (1 - BETA2)
+        g = sp.grad * clip_scale
+        adam_m[i] = adam_m[i] * BETA1 + g * (1 - BETA1)
+        adam_v[i] = adam_v[i] * BETA2 + (g * g) * (1 - BETA2)
         m_hat = adam_m[i] * (1.0 / bc1)
         v_hat = adam_v[i] * (1.0 / bc2)
-        sp.data -= LEARNING_RATE * m_hat / (v_hat ** 0.5 + EPS_ADAM)
+        update = m_hat / (v_hat ** 0.5 + EPS_ADAM)
+        if not no_decay_flags[i]:
+            update = update + sp.data * WEIGHT_DECAY  # decoupled weight decay
+        sp.data -= update * lr
         tp.data = tp.data * EMA_MOMENTUM + sp.data * (1 - EMA_MOMENTUM)
         sp.grad = Raw.vals_like(*sp.shape())
 
-    # snapshot gram anchor teacher at warmup boundary
-    if GRAM_ANCHORING and step == GRAM_START_STEP:
-        gram_state_dict = copy.deepcopy(teacher_state_dict)
-
-    if step % 100 == 0:
+    if step % LOG_EVERY == 0:
+        # Report each objective as a mean per term, so they are directly comparable to the collapse
+        # floor ln(HEAD_PROTOTYPES) instead of scaling with the number of crops.
         elapsed = time.time() - t_start
-        log(f"step {step:4d} | dino: {dino_loss_acc/BATCH_SIZE:.3f}  ibot: {ibot_loss_acc/BATCH_SIZE:.3f}  koleo: {koleo_loss_acc/BATCH_SIZE:.3f}  gram: {gram_loss_acc/BATCH_SIZE:.3f} | total: {total_loss.item():.3f} | {elapsed:.1f}s")
+        n_dino_terms = BATCH_SIZE * (DINO_GLOBAL_TERMS + DINO_LOCAL_TERMS)
+        n_crop_terms = BATCH_SIZE * GLOBAL_CROPS
+        log(f"step {step:4d} | dino: {dino_loss_acc/n_dino_terms:.3f}  ibot: {ibot_loss_acc/n_crop_terms:.3f}  "
+            f"koleo: {koleo_loss_acc:.3f}  gram: {gram_loss_acc/n_crop_terms:.4f} | "
+            f"total: {total_loss.item():.3f} | lr {lr:.2e} | gnorm {gnorm:.2f} | {elapsed:.1f}s")
 
-KNN_IMAGES = 500
-TOP_K = 5
+KNN_IMAGES = _envi('KNN_IMAGES', 500)
+TOP_K = _envi('TOP_K', 5)
+N_TEST = _envi('N_TEST', len(test_images))
+test_images, test_labels = test_images[:N_TEST], test_labels[:N_TEST]
 
 def knn_evaluate(embeddings, embed_labels, test_imgs, test_lbls, top_k=TOP_K):
     """Evaluate kNN accuracy over all test images. Returns (correct, total, example_predictions)."""
