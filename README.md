@@ -57,23 +57,35 @@ Weights are written to `student_final.json` / `teacher_final.json` at the end.
 
 ## Results
 
-kNN probe on MNIST (200-image database, top-5, 1000 test images), 150 steps at batch 8.
+The reference run is short — 150 steps at batch 8 — because a step of pure-Python autograd
+costs about 14 seconds. Treat these as a correctness check, not a result.
+
+kNN probe on MNIST, 200-image database, top-5, 1000 test images:
 
 | Probe | Accuracy |
 |---|---|
-| Random init (identical weights, zero training) | *see `output.txt`* |
-| Trained, pre-head CLS (32-dim) | *see `output.txt`* |
-| Trained, post-head DINO output (32-dim) | *see `output.txt`* |
+| Random init (identical weights, zero training) | 24.5% |
+| Trained, pre-head CLS (32-dim) | 25.1% |
+| Trained, post-head DINO output (32-dim) | 25.2% |
+| Same run with Gram anchoring disabled, pre-head | 22.0% |
+
+**These deltas are not statistically meaningful.** At n=1000 one standard error is about
+1.4 points, so +0.6 over the random-init control is noise, and the +3.1 gap between the
+Gram and no-Gram runs is under 2 sigma. What the run does establish is that the objectives
+optimize: the iBOT loss falls from 3.88 to around 3.0, below the ln(32)=3.466 floor that a
+uniform prediction would give, and the Gram loss falls from 0.30 to 0.14 once it engages at
+step 50. The DINO loss sits at 3.466 — with genuine cross-view crops rather than
+self-prediction, 150 steps is not enough for it to move.
 
 **On baselines.** The meaningful control for a representation probe is *the same
 architecture at initialization*, not chance. A randomly initialized ViT already scores far
-above 10% on this task, so "vs 10% random" would overstate what training accomplished; the
-run therefore evaluates its own starting weights and reports the delta. For scale on the
-other side: raw pixels under the identical kNN protocol score around 80%, well above
-anything this 32-dim representation produces. Both evaluation probes run with
-`train=False`, so no RoPE jitter is applied at inference and the numbers are deterministic.
+above 10% here, so "vs 10% random" would overstate what training accomplished; the run
+evaluates its own starting weights and reports the delta. For scale in the other direction,
+raw pixels under the identical kNN protocol score around 80% — well above anything this
+32-dim representation produces. Both probes run with `train=False`, so no RoPE jitter is
+applied at inference and the numbers are deterministic.
 
-`output.txt` contains a full training log.
+`output.txt` contains the full training log for the run in the table.
 
 ## Scope and honest limitations
 
