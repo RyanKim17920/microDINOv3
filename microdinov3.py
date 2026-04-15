@@ -18,11 +18,20 @@ random.seed(42)
 import urllib.request, ssl
 MNIST = "https://ossci-datasets.s3.amazonaws.com/mnist"
 
+CACHE_DIR = ".mnist_cache"
+
 def fetch(url):
-    try: return gzip.decompress(urllib.request.urlopen(url).read())
+    # cached on disk so repeated runs do not re-download ~60MB every time
+    path = os.path.join(CACHE_DIR, url.rsplit('/', 1)[-1])
+    if os.path.exists(path):
+        with open(path, 'rb') as f: return gzip.decompress(f.read())
+    try: raw = urllib.request.urlopen(url).read()
     except:
         ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-        return gzip.decompress(urllib.request.urlopen(url, context=ctx).read())
+        raw = urllib.request.urlopen(url, context=ctx).read()
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(path, 'wb') as f: f.write(raw)
+    return gzip.decompress(raw)
 
 def parse_images(buf):
     _, n, rows, cols = struct.unpack('>IIII', buf[:16])
@@ -644,13 +653,16 @@ def log_softmax_tensor(x, temp=STUDENT_TEMP):
 
 
 import time
+OUTPUT_PATH = os.getenv('OUTPUT', 'output.txt')
 
-outf = open('output.txt', 'w')
+outf = open(OUTPUT_PATH, 'w')
 header = (f"N_EMBED={N_EMBED} N_LAYER={N_LAYER} N_HEAD={N_HEAD} HEAD_PROTOTYPES={HEAD_PROTOTYPES} "
           f"BATCH_SIZE={BATCH_SIZE} NUM_STEPS={NUM_STEPS} LR={LEARNING_RATE} STUDENT_TEMP={STUDENT_TEMP} "
           f"TEACHER_TEMP={TEACHER_TEMP} EMA_MOMENTUM={EMA_MOMENTUM} MASK_RATIO={MASK_RATIO} "
           f"DINO_WEIGHT={DINO_WEIGHT} IBOT_WEIGHT={IBOT_WEIGHT} KOLEO_WEIGHT={KOLEO_WEIGHT} "
-          f"USE_SINKHORN={USE_SINKHORN} CENTER_MOMENTUM={CENTER_MOMENTUM} GRAM_ANCHORING={GRAM_ANCHORING}")
+          f"USE_SINKHORN={USE_SINKHORN} CENTER_MOMENTUM={CENTER_MOMENTUM} GRAM_ANCHORING={GRAM_ANCHORING} "
+          f"GRAM_WEIGHT={GRAM_WEIGHT} GRAM_START_STEP={GRAM_START_STEP} GLOBAL_CROPS={GLOBAL_CROPS} "
+          f"LOCAL_CROPS={LOCAL_CROPS} WEIGHT_DECAY={WEIGHT_DECAY} WARMUP_STEPS={WARMUP_STEPS} CLIP_GRAD={CLIP_GRAD}")
 outf.write(header + '\n')
 outf.flush()
 
@@ -850,52 +862,48 @@ def knn_evaluate(embeddings, embed_labels, test_imgs, test_lbls, top_k=TOP_K):
             log(f"  ... evaluated {qi + 1}/{total} test images")
     return correct, total, examples
 
-# --- Post-head evaluation (DINO head output) ---
-log(f"\n--- KNN Evaluation (post-head, {HEAD_PROTOTYPES}-dim DINO output) ---")
-log(f"Embedding {KNN_IMAGES} train images...")
-embeddings_post = []
-embed_labels_post = []
-for i in range(KNN_IMAGES):
-    dino_out = vit(Raw(train_images[i]), student_state_dict, train=True)[0]  # post-head (1, HEAD_PROTOTYPES)
-    embeddings_post.append(l2_norm(dino_out.data).data[0])
-    embed_labels_post.append(train_labels[i])
+# --- Checkpoint ---
+# The previous version saved nothing, so a 22-hour run left no recoverable weights.
+import json
+def save_ckpt(path, sd):
+    with open(path, 'w') as f:
+        json.dump({k: v.data.data for k, v in sd.items()}, f)
+save_ckpt('student_final.json', student_state_dict)
+save_ckpt('teacher_final.json', teacher_state_dict)
+log("\nSaved student_final.json / teacher_final.json")
 
-log(f"Evaluating {len(test_images)} test images...")
-# pre-compute all test embeddings (post-head)
-test_embeds_post = []
-for qi in range(len(test_images)):
-    dino_out = vit(Raw(test_images[qi]), student_state_dict, train=True)[0]
-    test_embeds_post.append(l2_norm(dino_out.data).data[0])
-    if (qi + 1) % 1000 == 0:
-        log(f"  ... embedded {qi + 1}/{len(test_images)} test images")
+# --- Evaluation ---
+# Both probes run with train=False. Previously the post-head probe passed train=True, which applied the
+# random RoPE box-jitter augmentation at inference and injected noise into the reported number.
+# apply_head is passed explicitly so the head can be read without turning training behaviour back on.
+def embed_all(imgs, sd, post_head):
+    out = []
+    for i, im in enumerate(imgs):
+        o = vit(Raw(im), sd, train=False, apply_head=post_head)
+        out.append(l2_norm((o[0] if post_head else o[2]).data).data[0])
+        if (i + 1) % 1000 == 0:
+            log(f"  ... embedded {i + 1}/{len(imgs)}")
+    return out
 
-correct, total, examples = knn_evaluate(embeddings_post, embed_labels_post, test_embeds_post, test_labels, TOP_K)
-log(f"Accuracy: {correct / total * 100:.1f}% ({correct}/{total}) [random=10%]")
-log("Examples:")
-for true_label, neighbor_labels in examples:
-    log(f"  [{true_label}]: {neighbor_labels}")
+def probe(name, sd, post_head, show_examples=True):
+    db = embed_all(train_images[:KNN_IMAGES], sd, post_head)
+    te = embed_all(test_images, sd, post_head)
+    correct, total, examples = knn_evaluate(db, train_labels[:KNN_IMAGES], te, test_labels, TOP_K)
+    log(f"{name}: {correct / total * 100:.1f}% ({correct}/{total})")
+    if show_examples:
+        for true_label, neighbor_labels in examples:
+            log(f"  [{true_label}]: {neighbor_labels}")
+    return correct / total * 100
 
-# --- Pre-head evaluation (raw CLS embedding) ---
-log(f"\n--- KNN Evaluation (pre-head, {N_EMBED}-dim CLS embedding) ---")
-log(f"Embedding {KNN_IMAGES} train images...")
-embeddings_pre = []
-embed_labels_pre = []
-for i in range(KNN_IMAGES):
-    cls = vit(Raw(train_images[i]), student_state_dict, train=False)[2]
-    embeddings_pre.append(l2_norm(cls.data).data[0])
-    embed_labels_pre.append(train_labels[i])
+log(f"\n--- KNN Evaluation ({KNN_IMAGES}-image database, top-{TOP_K}, {len(test_images)} test images) ---")
+acc_pre  = probe(f"trained  pre-head CLS ({N_EMBED}-dim)", student_state_dict, post_head=False)
+acc_post = probe(f"trained  post-head DINO ({HEAD_PROTOTYPES}-dim)", student_state_dict, post_head=True)
 
-log(f"Evaluating {len(test_images)} test images...")
-# pre-compute all test embeddings (pre-head)
-test_embeds_pre = []
-for qi in range(len(test_images)):
-    cls = vit(Raw(test_images[qi]), student_state_dict, train=False)[2]
-    test_embeds_pre.append(l2_norm(cls.data).data[0])
-    if (qi + 1) % 1000 == 0:
-        log(f"  ... embedded {qi + 1}/{len(test_images)} test images")
+# --- Random-init control ---
+# The honest baseline is the same architecture at initialization, not chance. init_state_dict is the
+# exact starting point of this run, so the delta below is attributable to training and nothing else.
+log("\n--- Random-init control (identical weights at step 0, zero training) ---")
+acc_rand = probe(f"random   pre-head CLS ({N_EMBED}-dim)", init_state_dict, post_head=False, show_examples=False)
 
-correct, total, examples = knn_evaluate(embeddings_pre, embed_labels_pre, test_embeds_pre, test_labels, TOP_K)
-log(f"Accuracy: {correct / total * 100:.1f}% ({correct}/{total}) [random=10%]")
-log("Examples:")
-for true_label, neighbor_labels in examples:
-    log(f"  [{true_label}]: {neighbor_labels}")
+log(f"\nSummary: random-init {acc_rand:.1f}% | trained pre-head {acc_pre:.1f}% | trained post-head {acc_post:.1f}% | chance 10.0%")
+log(f"Training delta over the random-init control: {acc_pre - acc_rand:+.1f} points")

@@ -21,3 +21,8 @@ training_log*.txt
 
 # claude code
 .claude
+# mnist download cache
+.mnist_cache/
+
+# checkpoints
+*.json
