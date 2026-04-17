@@ -26,3 +26,7 @@ training_log*.txt
 
 # checkpoints
 *.json
+
+# run artifacts
+COMPLETE
+train_long.log

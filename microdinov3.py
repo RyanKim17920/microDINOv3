@@ -11,6 +11,11 @@ import random
 import gzip
 import struct
 import copy
+from operator import mul as _mul, add as _add
+try:
+    from math import sumprod          # C dot product, ~6x faster than the equivalent generator
+except ImportError:                   # py < 3.12
+    def sumprod(a, b): return sum(map(_mul, a, b))
 
 random.seed(42)
 
@@ -78,7 +83,7 @@ class Raw(Arithmetic):
     def clamp(self, lo=0, hi=1): return Raw([[max(lo, min(hi, a)) for a in row] for row in self.data])
     # arithmetic operators
     def __add__(self, other):
-        if isinstance(other, Raw): return Raw([[a + b for a, b in zip(row_a, row_b)] for row_a, row_b in zip(self.data, other.data)])
+        if isinstance(other, Raw): return Raw([list(map(_add, row_a, row_b)) for row_a, row_b in zip(self.data, other.data)])
         else: return Raw([[a + other for a in row] for row in self.data])
     def __iadd__(self, other): # in-place for grad accumulation speed
         if isinstance(other, Raw):
@@ -87,11 +92,13 @@ class Raw(Arithmetic):
                   self.data[i][j] += other.data[i][j]
         return self
     def __mul__(self, other):
-        if isinstance(other, Raw): return Raw([[a * b for a, b in zip(ra, rb)] for ra, rb in zip(self.data, other.data)]) # hadamard multiplication
+        if isinstance(other, Raw): return Raw([list(map(_mul, ra, rb)) for ra, rb in zip(self.data, other.data)]) # hadamard multiplication
         else: return Raw([[a * other for a in row] for row in self.data])
     def __matmul__(self, other):
+        # sumprod is the whole matmul inner loop in C, and accumulates more accurately than a running
+        # float sum. Transposing once up front keeps the columns contiguous.
         oT = list(zip(*other.data))
-        return Raw([[sum(a*b for a,b in zip(row, col)) for col in oT] for row in self.data])
+        return Raw([[sumprod(row, col) for col in oT] for row in self.data])
     def __pow__(self, val): return Raw([[a**val for a in row] for row in self.data])
     # indexing
     def __getitem__(self, idx):
@@ -128,12 +135,22 @@ class Raw(Arithmetic):
         return e * e.row_sum() ** -1      
         
 
-# Autograd engine, raw ops with backward 
+# The teacher is never differentiated through, so tensors it builds need no gradient buffer and no tape.
+NO_GRAD = [False]  # a list, so the flag can be flipped without a global statement
+
+class no_grad:
+    def __enter__(self): NO_GRAD[0] = True
+    def __exit__(self, *exc): NO_GRAD[0] = False; return False
+
+# Autograd engine, raw ops with backward
 class Tensor(Arithmetic):
     __slots__ = ('data', 'grad', '_children', '_backward', 'requires_grad')
     # construction
     def __init__(self, data, children=(), _backward=None, requires_grad=True):
         self.data = data if isinstance(data, Raw) else Raw(data)
+        if NO_GRAD[0]:  # no buffer, no tape, so backward() can never reach this tensor
+            self.grad, self._children, self._backward, self.requires_grad = None, (), None, False
+            return
         self.grad = Raw.vals_like(*self.data.shape()) if requires_grad else None
         self._children = children
         self._backward = _backward
@@ -674,6 +691,60 @@ def log(msg):
 log(f"train: {len(train_images)}, test: {len(test_images)}, size: {rows}x{cols}")
 log(f'Parameters: {sum(p.shape()[0] * p.shape()[1] for p in student_params)}')
 
+KNN_IMAGES = _envi('KNN_IMAGES', 5000)   # kNN database size
+TOP_K      = _envi('TOP_K', 5)
+N_TEST     = _envi('N_TEST', len(test_images))
+test_images, test_labels = test_images[:N_TEST], test_labels[:N_TEST]
+PROBE_EVERY = _envi('PROBE_EVERY', 0)      # 0 disables the periodic learning-curve probe
+PROBE_DB    = _envi('PROBE_DB', 1000)      # smaller database/test split for the periodic probe
+PROBE_TEST  = _envi('PROBE_TEST', 2000)
+CKPT_EVERY  = _envi('CKPT_EVERY', 200)
+
+import json, heapq
+
+def save_ckpt(path, sd):
+    with open(path, 'w') as f:
+        json.dump({k: v.data.data for k, v in sd.items()}, f)
+
+def knn_evaluate(db, db_labels, queries, query_labels, top_k=TOP_K):
+    """Top-k cosine kNN with majority vote. Returns (accuracy%, standard error%, examples)."""
+    correct, examples = 0, []
+    for qi, qv in enumerate(queries):
+        sims = [sumprod(qv, e) for e in db]
+        top = heapq.nlargest(top_k, range(len(db)), key=sims.__getitem__)
+        neighbours = [db_labels[i] for i in top]
+        votes = {}
+        for lbl in neighbours: votes[lbl] = votes.get(lbl, 0) + 1
+        if max(votes, key=votes.get) == query_labels[qi]: correct += 1
+        if len(examples) < 10: examples.append((query_labels[qi], neighbours))
+    n = len(queries)
+    acc = correct / n
+    se = (acc * (1 - acc) / n) ** 0.5          # binomial standard error on the accuracy estimate
+    return acc * 100, se * 100, examples
+
+# Both probes run with train=False, so no RoPE box jitter is applied at inference and the numbers are
+# deterministic. apply_head is separate from train so the head can be read without training behaviour.
+def embed_all(imgs, sd, post_head):
+    out = []
+    for im in imgs:
+        with no_grad():
+            o = vit(Raw(im), sd, train=False, apply_head=post_head)
+        out.append(l2_norm((o[0] if post_head else o[2]).data).data[0])
+    return out
+
+def probe(name, sd, post_head, n_db=None, n_test=None, show_examples=False):
+    n_db = n_db or KNN_IMAGES
+    qs = test_images if n_test is None else test_images[:n_test]
+    ls = test_labels if n_test is None else test_labels[:n_test]
+    db = embed_all(train_images[:n_db], sd, post_head)
+    te = embed_all(qs, sd, post_head)
+    acc, se, examples = knn_evaluate(db, train_labels[:n_db], te, ls)
+    log(f"{name}: {acc:.2f}% +/- {se:.2f} (n={len(qs)}, db={n_db})")
+    if show_examples:
+        for true_label, neighbours in examples: log(f"  [{true_label}]: {neighbours}")
+    return acc, se
+
+
 t_start = time.time()
 
 # Gram teacher: a frozen snapshot of the EMA teacher, taken once dense features are healthy and then
@@ -708,7 +779,8 @@ for step in range(NUM_STEPS):
         masks = [random_mask(n_gp) for _ in global_crops]
         masked_idxs = [[i for i, m in enumerate(mask) if m] for mask in masks]
         # teacher runs in eval mode: no RoPE box jitter, matching the official teacher being .eval()
-        teacher_outs = [vit(gc, teacher_state_dict, train=False, apply_head=True) for gc in global_crops]
+        with no_grad():
+            teacher_outs = [vit(gc, teacher_state_dict, train=False, apply_head=True) for gc in global_crops]
         for t in teacher_outs:
             all_teacher_cls.append(t[0].data.data[0])
         batch_data.append((global_crops, local_crops, masks, masked_idxs, teacher_outs))
@@ -766,7 +838,8 @@ for step in range(NUM_STEPS):
 
             if gram_state_dict is not None:
                 # Gram teacher features are constants: read .data so no gradient flows into the snapshot
-                gram_feats = vit(gc, gram_state_dict, train=False, apply_head=False)[4].data
+                with no_grad():
+                    gram_feats = vit(gc, gram_state_dict, train=False, apply_head=False)[4].data
                 l = gram_loss(s_patch_pre, gram_feats)
                 total_loss += l * GRAM_WEIGHT
                 gram_loss_acc += l.item()
@@ -833,77 +906,48 @@ for step in range(NUM_STEPS):
             f"koleo: {koleo_loss_acc:.3f}  gram: {gram_loss_acc/n_crop_terms:.4f} | "
             f"total: {total_loss.item():.3f} | lr {lr:.2e} | gnorm {gnorm:.2f} | {elapsed:.1f}s")
 
-KNN_IMAGES = _envi('KNN_IMAGES', 500)
-TOP_K = _envi('TOP_K', 5)
-N_TEST = _envi('N_TEST', len(test_images))
-test_images, test_labels = test_images[:N_TEST], test_labels[:N_TEST]
+    # checkpoint periodically so an interrupted run does not lose everything
+    if CKPT_EVERY and step % CKPT_EVERY == 0 and step > 0:
+        save_ckpt('student_ckpt.json', student_state_dict)
+        save_ckpt('teacher_ckpt.json', teacher_state_dict)
 
-def knn_evaluate(embeddings, embed_labels, test_imgs, test_lbls, top_k=TOP_K):
-    """Evaluate kNN accuracy over all test images. Returns (correct, total, example_predictions)."""
-    total = len(test_imgs)
-    correct = 0
-    examples = []  # collect first 10 for visual inspection
-    for qi in range(total):
-        qv = test_imgs[qi]
-        # cosine similarity against all train embeddings
-        sims = [sum(a * b for a, b in zip(qv, emb)) for emb in embeddings]
-        top_k_idxs = sorted(range(len(embeddings)), key=lambda i: sims[i], reverse=True)[:top_k]
-        neighbor_labels = [embed_labels[i] for i in top_k_idxs]
-        # majority vote
-        votes = {}
-        for lbl in neighbor_labels:
-            votes[lbl] = votes.get(lbl, 0) + 1
-        predicted = max(votes, key=votes.get)
-        if predicted == test_lbls[qi]:
-            correct += 1
-        if len(examples) < 10:
-            examples.append((test_lbls[qi], neighbor_labels))
-        if (qi + 1) % 1000 == 0:
-            log(f"  ... evaluated {qi + 1}/{total} test images")
-    return correct, total, examples
+    # learning curve: a cheaper probe on a fixed subset, so we can see whether it is still improving
+    if PROBE_EVERY and step % PROBE_EVERY == 0 and step > 0:
+        probe(f"  [curve] step {step:5d} pre-head", student_state_dict, False, n_db=PROBE_DB, n_test=PROBE_TEST)
 
-# --- Checkpoint ---
-# The previous version saved nothing, so a 22-hour run left no recoverable weights.
-import json
-def save_ckpt(path, sd):
-    with open(path, 'w') as f:
-        json.dump({k: v.data.data for k, v in sd.items()}, f)
+
+# --- Final evaluation ---
 save_ckpt('student_final.json', student_state_dict)
 save_ckpt('teacher_final.json', teacher_state_dict)
 log("\nSaved student_final.json / teacher_final.json")
 
-# --- Evaluation ---
-# Both probes run with train=False. Previously the post-head probe passed train=True, which applied the
-# random RoPE box-jitter augmentation at inference and injected noise into the reported number.
-# apply_head is passed explicitly so the head can be read without turning training behaviour back on.
-def embed_all(imgs, sd, post_head):
-    out = []
-    for i, im in enumerate(imgs):
-        o = vit(Raw(im), sd, train=False, apply_head=post_head)
-        out.append(l2_norm((o[0] if post_head else o[2]).data).data[0])
-        if (i + 1) % 1000 == 0:
-            log(f"  ... embedded {i + 1}/{len(imgs)}")
-    return out
+log(f"\n--- Final kNN evaluation (db={KNN_IMAGES}, top-{TOP_K}, {len(test_images)} test images) ---")
+acc_pre,  se_pre  = probe(f"trained  pre-head CLS  ({N_EMBED}-dim)", student_state_dict, False, show_examples=True)
+acc_post, se_post = probe(f"trained  post-head DINO ({HEAD_PROTOTYPES}-dim)", student_state_dict, True)
 
-def probe(name, sd, post_head, show_examples=True):
-    db = embed_all(train_images[:KNN_IMAGES], sd, post_head)
-    te = embed_all(test_images, sd, post_head)
-    correct, total, examples = knn_evaluate(db, train_labels[:KNN_IMAGES], te, test_labels, TOP_K)
-    log(f"{name}: {correct / total * 100:.1f}% ({correct}/{total})")
-    if show_examples:
-        for true_label, neighbor_labels in examples:
-            log(f"  [{true_label}]: {neighbor_labels}")
-    return correct / total * 100
+# The honest baseline is this run's own starting weights, not chance. init_state_dict is untouched.
+log("\n--- Controls ---")
+acc_rand, se_rand = probe(f"random-init pre-head CLS ({N_EMBED}-dim)", init_state_dict, False)
 
-log(f"\n--- KNN Evaluation ({KNN_IMAGES}-image database, top-{TOP_K}, {len(test_images)} test images) ---")
-acc_pre  = probe(f"trained  pre-head CLS ({N_EMBED}-dim)", student_state_dict, post_head=False)
-acc_post = probe(f"trained  post-head DINO ({HEAD_PROTOTYPES}-dim)", student_state_dict, post_head=True)
+# Raw pixels under the identical protocol, for scale on the other side.
+def l2_list(v):
+    n = sumprod(v, v) ** 0.5 or 1.0
+    return [x / n for x in v]
+flat = lambda im: [p for row in im for p in row]
+raw_db = [l2_list(flat(im)) for im in train_images[:KNN_IMAGES]]
+raw_te = [l2_list(flat(im)) for im in test_images]
+acc_raw, se_raw, _ = knn_evaluate(raw_db, train_labels[:KNN_IMAGES], raw_te, test_labels)
+log(f"raw-pixel kNN (784-dim): {acc_raw:.2f}% +/- {se_raw:.2f}")
 
-# --- Random-init control ---
-# The honest baseline is the same architecture at initialization, not chance. init_state_dict is the
-# exact starting point of this run, so the delta below is attributable to training and nothing else.
-log("\n--- Random-init control (identical weights at step 0, zero training) ---")
-acc_rand = probe(f"random   pre-head CLS ({N_EMBED}-dim)", init_state_dict, post_head=False, show_examples=False)
+delta = acc_pre - acc_rand
+se_delta = (se_pre ** 2 + se_rand ** 2) ** 0.5   # the two probes share a test set, so this is conservative
+log(f"\nSummary: random-init {acc_rand:.2f}% | trained pre-head {acc_pre:.2f}% | "
+    f"trained post-head {acc_post:.2f}% | raw pixels {acc_raw:.2f}% | chance 10.00%")
+log(f"Training delta over random init: {delta:+.2f} +/- {se_delta:.2f} points "
+    f"({abs(delta)/se_delta:.1f} sigma) -> {'exceeds noise' if abs(delta) > 2*se_delta else 'WITHIN NOISE'}")
 
-log(f"\nSummary: random-init {acc_rand:.1f}% | trained pre-head {acc_pre:.1f}% | trained post-head {acc_post:.1f}% | chance 10.0%")
-log(f"Training delta over the random-init control: {acc_pre - acc_rand:+.1f} points")
+log(f"\nTotal wall clock: {(time.time() - t_start)/3600:.2f}h over {NUM_STEPS} steps")
+with open('COMPLETE', 'w') as f:
+    f.write(f"steps={NUM_STEPS} batch={BATCH_SIZE} random_init={acc_rand:.2f} pre_head={acc_pre:.2f} "
+            f"post_head={acc_post:.2f} raw_pixel={acc_raw:.2f} delta={delta:+.2f} se={se_delta:.2f}\n")
+log("COMPLETE")

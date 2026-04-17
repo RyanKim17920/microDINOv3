@@ -1,56 +1,118 @@
-N_EMBED=32 N_LAYER=2 N_HEAD=4 HEAD_PROTOTYPES=32 BATCH_SIZE=8 NUM_STEPS=150 LR=0.001 STUDENT_TEMP=0.1 TEACHER_TEMP=0.07 EMA_MOMENTUM=0.999 MASK_RATIO=0.3 DINO_WEIGHT=1.0 IBOT_WEIGHT=1.0 KOLEO_WEIGHT=0.1 USE_SINKHORN=False CENTER_MOMENTUM=0.9 GRAM_ANCHORING=True GRAM_WEIGHT=2.0 GRAM_START_STEP=50 GLOBAL_CROPS=2 LOCAL_CROPS=2 WEIGHT_DECAY=0.04 WARMUP_STEPS=20 CLIP_GRAD=30.0
+N_EMBED=32 N_LAYER=2 N_HEAD=4 HEAD_PROTOTYPES=32 BATCH_SIZE=32 NUM_STEPS=2000 LR=0.001 STUDENT_TEMP=0.1 TEACHER_TEMP=0.07 EMA_MOMENTUM=0.999 MASK_RATIO=0.3 DINO_WEIGHT=1.0 IBOT_WEIGHT=1.0 KOLEO_WEIGHT=0.1 USE_SINKHORN=False CENTER_MOMENTUM=0.9 GRAM_ANCHORING=True GRAM_WEIGHT=2.0 GRAM_START_STEP=500 GLOBAL_CROPS=2 LOCAL_CROPS=2 WEIGHT_DECAY=0.04 WARMUP_STEPS=100 CLIP_GRAD=30.0
 train: 60000, test: 10000, size: 28x28
 Parameters: 32736
-step    0 | dino: 1.527  ibot: 3.880  koleo: 0.538  gram: 0.0000 | total: 9.824 | lr 5.00e-05 | gnorm 1269.93 | 10.5s
-step   10 | dino: 3.153  ibot: 3.243  koleo: 0.472  gram: 0.0000 | total: 10.112 | lr 5.50e-04 | gnorm 142.24 | 141.4s
-step   20 | dino: 3.751  ibot: 3.131  koleo: 0.247  gram: 0.0000 | total: 10.260 | lr 1.00e-03 | gnorm 51.98 | 280.7s
-step   30 | dino: 3.699  ibot: 2.904  koleo: 0.162  gram: 0.0000 | total: 9.668 | lr 1.00e-03 | gnorm 28.13 | 419.7s
-step   40 | dino: 3.610  ibot: 2.896  koleo: 0.208  gram: 0.0000 | total: 9.611 | lr 1.00e-03 | gnorm 78.15 | 552.2s
-step   50 | dino: 3.556  ibot: 2.993  koleo: 0.118  gram: 0.3029 | total: 10.873 | lr 1.00e-03 | gnorm 36.02 | 686.2s
-step   60 | dino: 3.505  ibot: 2.932  koleo: 0.201  gram: 0.2038 | total: 10.385 | lr 1.00e-03 | gnorm 46.30 | 805.2s
-step   70 | dino: 3.493  ibot: 3.017  koleo: 0.099  gram: 0.1487 | total: 10.222 | lr 1.00e-03 | gnorm 31.78 | 971.6s
-step   80 | dino: 3.477  ibot: 3.088  koleo: 0.109  gram: 0.1701 | total: 10.441 | lr 1.00e-03 | gnorm 54.78 | 1105.8s
-step   90 | dino: 3.484  ibot: 2.972  koleo: 0.082  gram: 0.1497 | total: 10.108 | lr 1.00e-03 | gnorm 19.50 | 1239.9s
-step  100 | dino: 3.476  ibot: 3.067  koleo: 0.110  gram: 0.1532 | total: 10.333 | lr 1.00e-03 | gnorm 31.49 | 1382.3s
-step  110 | dino: 3.470  ibot: 3.081  koleo: 0.068  gram: 0.1561 | total: 10.325 | lr 1.00e-03 | gnorm 18.15 | 1489.8s
-step  120 | dino: 3.466  ibot: 2.989  koleo: 0.090  gram: 0.1235 | total: 10.028 | lr 1.00e-03 | gnorm 19.53 | 1606.0s
-step  130 | dino: 3.465  ibot: 3.104  koleo: 0.056  gram: 0.1477 | total: 10.320 | lr 1.00e-03 | gnorm 30.40 | 1756.8s
-step  140 | dino: 3.466  ibot: 3.034  koleo: 0.043  gram: 0.1408 | total: 10.139 | lr 1.00e-03 | gnorm 18.30 | 1920.8s
+step    0 | dino: 1.516  ibot: 4.601  koleo: 0.554  gram: 0.0000 | total: 11.272 | lr 1.00e-05 | gnorm 1337.47 | 18.0s
+step   25 | dino: 3.930  ibot: 2.997  koleo: 0.485  gram: 0.0000 | total: 10.410 | lr 2.60e-04 | gnorm 88.20 | 534.1s
+step   50 | dino: 3.681  ibot: 2.898  koleo: 0.195  gram: 0.0000 | total: 9.671 | lr 5.10e-04 | gnorm 145.23 | 1041.2s
+step   75 | dino: 3.545  ibot: 2.856  koleo: 0.095  gram: 0.0000 | total: 9.352 | lr 7.60e-04 | gnorm 95.31 | 1655.0s
+step  100 | dino: 3.482  ibot: 2.859  koleo: 0.137  gram: 0.0000 | total: 9.337 | lr 1.00e-03 | gnorm 108.93 | 2134.7s
+step  125 | dino: 3.469  ibot: 2.754  koleo: 0.117  gram: 0.0000 | total: 9.092 | lr 1.00e-03 | gnorm 27.53 | 2650.9s
+step  150 | dino: 3.476  ibot: 2.717  koleo: 0.119  gram: 0.0000 | total: 9.030 | lr 1.00e-03 | gnorm 20.61 | 3119.5s
+step  175 | dino: 3.475  ibot: 2.742  koleo: 0.208  gram: 0.0000 | total: 9.166 | lr 1.00e-03 | gnorm 28.77 | 3583.5s
+step  200 | dino: 3.474  ibot: 2.810  koleo: 0.167  gram: 0.0000 | total: 9.260 | lr 1.00e-03 | gnorm 16.30 | 4075.3s
+  [curve] step   200 pre-head: 30.75% +/- 1.03 (n=2000, db=1000)
+step  225 | dino: 3.471  ibot: 2.602  koleo: 0.092  gram: 0.0000 | total: 8.768 | lr 1.00e-03 | gnorm 9.72 | 4782.5s
+step  250 | dino: 3.467  ibot: 2.751  koleo: 0.076  gram: 0.0000 | total: 9.044 | lr 1.00e-03 | gnorm 11.84 | 5064.0s
+step  275 | dino: 3.467  ibot: 2.737  koleo: 0.165  gram: 0.0000 | total: 9.107 | lr 1.00e-03 | gnorm 31.60 | 5328.0s
+step  300 | dino: 3.479  ibot: 2.676  koleo: 0.110  gram: 0.0000 | total: 8.941 | lr 1.00e-03 | gnorm 21.02 | 5591.5s
+step  325 | dino: 3.473  ibot: 2.750  koleo: 0.099  gram: 0.0000 | total: 9.073 | lr 1.00e-03 | gnorm 12.97 | 5863.0s
+step  350 | dino: 3.467  ibot: 2.647  koleo: 0.069  gram: 0.0000 | total: 8.831 | lr 1.00e-03 | gnorm 11.31 | 6154.3s
+step  375 | dino: 3.465  ibot: 2.703  koleo: 0.073  gram: 0.0000 | total: 8.944 | lr 1.00e-03 | gnorm 17.67 | 6427.0s
+step  400 | dino: 3.466  ibot: 2.513  koleo: 0.063  gram: 0.0000 | total: 8.554 | lr 1.00e-03 | gnorm 14.28 | 6707.0s
+  [curve] step   400 pre-head: 37.25% +/- 1.08 (n=2000, db=1000)
+step  425 | dino: 3.466  ibot: 2.678  koleo: 0.075  gram: 0.0000 | total: 8.897 | lr 1.00e-03 | gnorm 17.52 | 7116.4s
+step  450 | dino: 3.465  ibot: 2.691  koleo: 0.049  gram: 0.0000 | total: 8.897 | lr 1.00e-03 | gnorm 23.20 | 7393.4s
+step  475 | dino: 3.468  ibot: 2.641  koleo: 0.055  gram: 0.0000 | total: 8.804 | lr 1.00e-03 | gnorm 9.44 | 7668.9s
+step  500 | dino: 3.463  ibot: 2.601  koleo: 0.042  gram: 0.1324 | total: 9.236 | lr 1.00e-03 | gnorm 13.83 | 7974.0s
+step  525 | dino: 3.464  ibot: 2.697  koleo: 0.046  gram: 0.0827 | total: 9.235 | lr 1.00e-03 | gnorm 32.95 | 8328.2s
+step  550 | dino: 3.460  ibot: 2.639  koleo: 0.063  gram: 0.0761 | total: 9.105 | lr 1.00e-03 | gnorm 8.12 | 8673.2s
+step  575 | dino: 3.467  ibot: 2.602  koleo: 0.057  gram: 0.0716 | total: 9.014 | lr 1.00e-03 | gnorm 9.19 | 9037.1s
+step  600 | dino: 3.403  ibot: 2.714  koleo: 0.058  gram: 0.0655 | total: 9.150 | lr 1.00e-03 | gnorm 8.19 | 9380.6s
+  [curve] step   600 pre-head: 43.20% +/- 1.11 (n=2000, db=1000)
+step  625 | dino: 3.441  ibot: 2.661  koleo: 0.034  gram: 0.0851 | total: 9.136 | lr 1.00e-03 | gnorm 18.76 | 9827.1s
+step  650 | dino: 3.456  ibot: 2.592  koleo: 0.075  gram: 0.0761 | total: 9.019 | lr 1.00e-03 | gnorm 26.04 | 10133.8s
+step  675 | dino: 3.462  ibot: 2.633  koleo: 0.052  gram: 0.0767 | total: 9.087 | lr 1.00e-03 | gnorm 11.10 | 10451.5s
+step  700 | dino: 3.440  ibot: 2.711  koleo: 0.055  gram: 0.0674 | total: 9.186 | lr 1.00e-03 | gnorm 17.01 | 10790.3s
+step  725 | dino: 3.437  ibot: 2.640  koleo: 0.042  gram: 0.0604 | total: 9.000 | lr 1.00e-03 | gnorm 7.02 | 11135.8s
+step  750 | dino: 3.443  ibot: 2.693  koleo: 0.052  gram: 0.0620 | total: 9.128 | lr 1.00e-03 | gnorm 23.32 | 11450.1s
+step  775 | dino: 3.450  ibot: 2.607  koleo: 0.053  gram: 0.0552 | total: 8.937 | lr 1.00e-03 | gnorm 16.99 | 11788.0s
+step  800 | dino: 3.446  ibot: 2.686  koleo: 0.034  gram: 0.0487 | total: 9.046 | lr 1.00e-03 | gnorm 15.61 | 12099.6s
+  [curve] step   800 pre-head: 47.50% +/- 1.12 (n=2000, db=1000)
+step  825 | dino: 3.435  ibot: 2.578  koleo: 0.024  gram: 0.0541 | total: 8.831 | lr 1.00e-03 | gnorm 10.32 | 12579.8s
+step  850 | dino: 3.439  ibot: 2.618  koleo: 0.025  gram: 0.0498 | total: 8.899 | lr 1.00e-03 | gnorm 9.77 | 12907.4s
+step  875 | dino: 3.434  ibot: 2.684  koleo: 0.027  gram: 0.0559 | total: 9.053 | lr 1.00e-03 | gnorm 19.20 | 13270.6s
+step  900 | dino: 3.440  ibot: 2.700  koleo: 0.029  gram: 0.0525 | total: 9.078 | lr 1.00e-03 | gnorm 25.16 | 13606.5s
+step  925 | dino: 3.438  ibot: 2.729  koleo: 0.027  gram: 0.0562 | total: 9.148 | lr 1.00e-03 | gnorm 12.28 | 13955.7s
+step  950 | dino: 3.441  ibot: 2.703  koleo: 0.028  gram: 0.0549 | total: 9.094 | lr 1.00e-03 | gnorm 8.93 | 14300.3s
+step  975 | dino: 3.456  ibot: 2.698  koleo: 0.026  gram: 0.0610 | total: 9.121 | lr 1.00e-03 | gnorm 9.73 | 14638.9s
+step 1000 | dino: 3.459  ibot: 2.693  koleo: 0.075  gram: 0.0520 | total: 9.127 | lr 1.00e-03 | gnorm 8.04 | 14982.1s
+  [curve] step  1000 pre-head: 46.55% +/- 1.12 (n=2000, db=1000)
+step 1025 | dino: 3.466  ibot: 2.700  koleo: 0.026  gram: 0.0471 | total: 9.080 | lr 1.00e-03 | gnorm 27.73 | 15424.7s
+step 1050 | dino: 3.462  ibot: 2.658  koleo: 0.044  gram: 0.0510 | total: 9.025 | lr 1.00e-03 | gnorm 8.28 | 15771.2s
+step 1075 | dino: 3.445  ibot: 2.620  koleo: 0.036  gram: 0.0417 | total: 8.887 | lr 1.00e-03 | gnorm 15.99 | 16119.4s
+step 1100 | dino: 3.465  ibot: 2.707  koleo: 0.033  gram: 0.0531 | total: 9.125 | lr 1.00e-03 | gnorm 12.25 | 16444.3s
+step 1125 | dino: 3.462  ibot: 2.693  koleo: 0.037  gram: 0.0509 | total: 9.089 | lr 1.00e-03 | gnorm 11.09 | 16764.3s
+step 1150 | dino: 3.456  ibot: 2.740  koleo: 0.034  gram: 0.0501 | total: 9.172 | lr 1.00e-03 | gnorm 19.51 | 17087.5s
+step 1175 | dino: 3.455  ibot: 2.637  koleo: 0.032  gram: 0.0453 | total: 8.943 | lr 1.00e-03 | gnorm 15.15 | 17418.9s
+step 1200 | dino: 3.453  ibot: 2.675  koleo: 0.056  gram: 0.0412 | total: 9.023 | lr 1.00e-03 | gnorm 5.55 | 17775.1s
+  [curve] step  1200 pre-head: 44.85% +/- 1.11 (n=2000, db=1000)
+step 1225 | dino: 3.464  ibot: 2.792  koleo: 0.031  gram: 0.0509 | total: 9.282 | lr 1.00e-03 | gnorm 12.71 | 18209.6s
+step 1250 | dino: 3.459  ibot: 2.673  koleo: 0.016  gram: 0.0413 | total: 8.986 | lr 1.00e-03 | gnorm 6.49 | 18537.4s
+step 1275 | dino: 3.455  ibot: 2.767  koleo: 0.051  gram: 0.0492 | total: 9.236 | lr 1.00e-03 | gnorm 7.16 | 18903.9s
+step 1300 | dino: 3.445  ibot: 2.830  koleo: 0.023  gram: 0.0375 | total: 9.277 | lr 1.00e-03 | gnorm 12.20 | 19276.7s
+step 1325 | dino: 3.450  ibot: 2.606  koleo: 0.026  gram: 0.0360 | total: 8.832 | lr 1.00e-03 | gnorm 11.38 | 19618.5s
+step 1350 | dino: 3.473  ibot: 2.734  koleo: 0.025  gram: 0.0409 | total: 9.131 | lr 1.00e-03 | gnorm 10.87 | 19968.7s
+step 1375 | dino: 3.457  ibot: 2.705  koleo: 0.027  gram: 0.0434 | total: 9.067 | lr 1.00e-03 | gnorm 16.83 | 20335.8s
+step 1400 | dino: 3.460  ibot: 2.587  koleo: 0.005  gram: 0.0397 | total: 8.797 | lr 1.00e-03 | gnorm 8.75 | 20694.3s
+  [curve] step  1400 pre-head: 46.10% +/- 1.11 (n=2000, db=1000)
+step 1425 | dino: 3.447  ibot: 2.646  koleo: 0.023  gram: 0.0392 | total: 8.919 | lr 1.00e-03 | gnorm 14.05 | 21144.5s
+step 1450 | dino: 3.456  ibot: 2.704  koleo: 0.041  gram: 0.0424 | total: 9.075 | lr 1.00e-03 | gnorm 7.81 | 21483.1s
+step 1475 | dino: 3.426  ibot: 2.531  koleo: 0.019  gram: 0.0371 | total: 8.655 | lr 1.00e-03 | gnorm 15.58 | 21865.3s
+step 1500 | dino: 3.447  ibot: 2.761  koleo: 0.015  gram: 0.0328 | total: 9.115 | lr 1.00e-03 | gnorm 12.37 | 22216.6s
+step 1525 | dino: 3.446  ibot: 2.709  koleo: 0.015  gram: 0.0359 | total: 9.023 | lr 1.00e-03 | gnorm 14.97 | 22597.2s
+step 1550 | dino: 3.448  ibot: 2.564  koleo: 0.016  gram: 0.0342 | total: 8.730 | lr 1.00e-03 | gnorm 7.31 | 23015.9s
+step 1575 | dino: 3.447  ibot: 2.590  koleo: 0.012  gram: 0.0346 | total: 8.779 | lr 1.00e-03 | gnorm 5.68 | 23418.5s
+step 1600 | dino: 3.454  ibot: 2.733  koleo: 0.016  gram: 0.0389 | total: 9.092 | lr 1.00e-03 | gnorm 9.18 | 23812.1s
+  [curve] step  1600 pre-head: 47.15% +/- 1.12 (n=2000, db=1000)
+step 1625 | dino: 3.442  ibot: 2.623  koleo: 0.029  gram: 0.0414 | total: 8.882 | lr 1.00e-03 | gnorm 22.73 | 24294.8s
+step 1650 | dino: 3.444  ibot: 2.642  koleo: 0.019  gram: 0.0369 | total: 8.893 | lr 1.00e-03 | gnorm 8.99 | 24680.6s
+step 1675 | dino: 3.447  ibot: 2.671  koleo: 0.012  gram: 0.0355 | total: 8.943 | lr 1.00e-03 | gnorm 19.19 | 25029.4s
+step 1700 | dino: 3.455  ibot: 2.727  koleo: 0.026  gram: 0.0374 | total: 9.085 | lr 1.00e-03 | gnorm 19.17 | 25391.2s
+step 1725 | dino: 3.459  ibot: 2.656  koleo: 0.017  gram: 0.0337 | total: 8.923 | lr 1.00e-03 | gnorm 46.69 | 25765.9s
+step 1750 | dino: 3.436  ibot: 2.680  koleo: 0.042  gram: 0.0339 | total: 8.973 | lr 1.00e-03 | gnorm 10.08 | 26170.2s
+step 1775 | dino: 3.449  ibot: 2.724  koleo: 0.014  gram: 0.0379 | total: 9.063 | lr 1.00e-03 | gnorm 5.57 | 26562.1s
+step 1800 | dino: 3.451  ibot: 2.632  koleo: 0.017  gram: 0.0314 | total: 8.859 | lr 1.00e-03 | gnorm 8.80 | 26955.2s
+  [curve] step  1800 pre-head: 45.20% +/- 1.11 (n=2000, db=1000)
+step 1825 | dino: 3.454  ibot: 2.754  koleo: 0.015  gram: 0.0349 | total: 9.117 | lr 1.00e-03 | gnorm 18.34 | 27461.0s
+step 1850 | dino: 3.456  ibot: 2.718  koleo: 0.020  gram: 0.0373 | total: 9.061 | lr 1.00e-03 | gnorm 8.98 | 27856.6s
+step 1875 | dino: 3.454  ibot: 2.575  koleo: 0.031  gram: 0.0353 | total: 8.777 | lr 1.00e-03 | gnorm 8.41 | 28232.2s
+step 1900 | dino: 3.459  ibot: 2.737  koleo: 0.027  gram: 0.0335 | total: 9.094 | lr 1.00e-03 | gnorm 14.67 | 28633.1s
+step 1925 | dino: 3.455  ibot: 2.741  koleo: 0.035  gram: 0.0424 | total: 9.142 | lr 1.00e-03 | gnorm 7.57 | 29045.0s
+step 1950 | dino: 3.456  ibot: 2.741  koleo: 0.040  gram: 0.0399 | total: 9.138 | lr 1.00e-03 | gnorm 12.40 | 29491.0s
+step 1975 | dino: 3.455  ibot: 2.491  koleo: 0.020  gram: 0.0352 | total: 8.597 | lr 1.00e-03 | gnorm 11.41 | 29933.3s
 
 Saved student_final.json / teacher_final.json
 
---- KNN Evaluation (200-image database, top-5, 1000 test images) ---
-  ... embedded 1000/1000
-  ... evaluated 1000/1000 test images
-trained  pre-head CLS (32-dim): 25.1% (251/1000)
-  [7]: [7, 7, 9, 7, 1]
-  [2]: [9, 6, 6, 9, 2]
-  [1]: [1, 1, 1, 7, 1]
-  [0]: [0, 3, 2, 2, 2]
-  [4]: [7, 4, 7, 7, 1]
-  [1]: [1, 7, 7, 1, 4]
-  [4]: [8, 4, 6, 4, 9]
-  [9]: [1, 9, 8, 6, 7]
-  [5]: [7, 4, 6, 8, 6]
-  [9]: [7, 8, 9, 3, 6]
-  ... embedded 1000/1000
-  ... evaluated 1000/1000 test images
-trained  post-head DINO (32-dim): 25.2% (252/1000)
-  [7]: [7, 7, 7, 4, 9]
-  [2]: [2, 0, 9, 8, 6]
+--- Final kNN evaluation (db=5000, top-5, 10000 test images) ---
+trained  pre-head CLS  (32-dim): 59.00% +/- 0.49 (n=10000, db=5000)
+  [7]: [7, 7, 9, 7, 0]
+  [2]: [2, 4, 2, 2, 6]
   [1]: [1, 1, 1, 1, 1]
-  [0]: [0, 0, 2, 3, 5]
-  [4]: [7, 4, 9, 1, 7]
-  [1]: [1, 7, 4, 7, 1]
-  [4]: [8, 4, 6, 7, 4]
-  [9]: [1, 9, 5, 6, 6]
-  [5]: [7, 0, 4, 2, 0]
-  [9]: [9, 7, 3, 8, 6]
+  [0]: [0, 0, 0, 0, 0]
+  [4]: [4, 4, 9, 9, 9]
+  [1]: [1, 1, 1, 7, 1]
+  [4]: [9, 5, 4, 9, 3]
+  [9]: [2, 2, 9, 9, 9]
+  [5]: [2, 6, 2, 2, 2]
+  [9]: [9, 8, 8, 3, 9]
+trained  post-head DINO (32-dim): 31.33% +/- 0.46 (n=10000, db=5000)
 
---- Random-init control (identical weights at step 0, zero training) ---
-  ... embedded 1000/1000
-  ... evaluated 1000/1000 test images
-random   pre-head CLS (32-dim): 24.5% (245/1000)
+--- Controls ---
+random-init pre-head CLS (32-dim): 29.85% +/- 0.46 (n=10000, db=5000)
+raw-pixel kNN (784-dim): 94.42% +/- 0.23
 
-Summary: random-init 24.5% | trained pre-head 25.1% | trained post-head 25.2% | chance 10.0%
-Training delta over the random-init control: +0.6 points
+Summary: random-init 29.85% | trained pre-head 59.00% | trained post-head 31.33% | raw pixels 94.42% | chance 10.00%
+Training delta over random init: +29.15 +/- 0.67 points (43.4 sigma) -> exceeds noise
+
+Total wall clock: 9.06h over 2000 steps
+COMPLETE
