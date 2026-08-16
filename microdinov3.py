@@ -195,7 +195,7 @@ class Tensor(Arithmetic):
                 if other.grad: other.grad += out.grad * self.data
             out._backward = _backward
             return out
-        else: return self._unary(self.data * other, other)  # Scalar product.
+        else: return self._unary(self.data * other, other)  # Scalar multiply.
 
     def __matmul__(self, other):
         out = Tensor(self.data @ other.data, (self, other))
