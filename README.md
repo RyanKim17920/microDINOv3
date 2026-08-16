@@ -1,6 +1,6 @@
 # microDINOv3
 
-A DINOv3-style self-supervised ViT in ~850 lines of pure, dependency-free Python.
+A DINOv3-style self-supervised ViT in ~950 lines of pure, dependency-free Python.
 No torch, no numpy — just stdlib. Inspired by Karpathy's microGPT.
 
 The point of this repo is the algorithm, written out in full: a reverse-mode autograd
